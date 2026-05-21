@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+.env.local
+*.log
+*.jsonl
+*.tgz
+.DS_Store
+
+# Runtime artifacts created by local Firecracker tests.
+*.socket
+*.ext4
+tmp/
