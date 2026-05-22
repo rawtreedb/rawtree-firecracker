@@ -517,7 +517,18 @@ rm -rf /workspace
 mkdir -p /workspace
 git clone --depth 1 https://github.com/jonschlinkert/is-odd.git /workspace/is-odd
 cd /workspace/is-odd
+git log --oneline -1
+'
+
+sudo --preserve-env=RAWTREE_API_KEY,RAWTREE_SANDBOX_TABLE go run . exec "$SANDBOX_ID" sh -lc '
+set -eu
+cd /workspace/is-odd
 npm install
+'
+
+sudo --preserve-env=RAWTREE_API_KEY,RAWTREE_SANDBOX_TABLE go run . exec "$SANDBOX_ID" sh -lc '
+set -eu
+cd /workspace/is-odd
 npm test
 '
 
