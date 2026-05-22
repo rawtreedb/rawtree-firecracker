@@ -12,10 +12,9 @@ create sandbox request
   -> select rootfs/image
   -> start RawTree host collector
   -> create Firecracker log and metrics files
-  -> configure Firecracker /logger
-  -> configure Firecracker /metrics
-  -> configure the normal microVM
-  -> start Firecracker
+  -> build firecracker-go-sdk Config
+  -> SDK configures Firecracker logger, metrics, boot source, drives, machine, and optional network
+  -> SDK starts Firecracker
   -> sample Firecracker host process and cgroup metrics
 ```
 
@@ -44,26 +43,26 @@ If the provider already has guest-level events from its own sandbox control plan
 
 ## Firecracker Logger
 
-The provider configures Firecracker's logger through the API:
+The provider configures Firecracker's logger through `firecracker-go-sdk`:
 
 ```txt
-PUT /logger
+Config.LogPath -> PUT /logger
 ```
 
 The log path is a per-sandbox host file. Firecracker writes VMM diagnostics there. The RawTree collector turns each log line into `sandbox.firecracker.vmm.log`.
 
 ## Firecracker Metrics
 
-The provider configures Firecracker's metrics system through the API:
+The provider configures Firecracker's metrics system through `firecracker-go-sdk`:
 
 ```txt
-PUT /metrics
+Config.MetricsPath -> PUT /metrics
 ```
 
 The metrics path is a per-sandbox host file. Firecracker writes JSON metrics there periodically and when the provider calls:
 
 ```txt
-PUT /actions { "action_type": "FlushMetrics" }
+Client.CreateSyncAction({ action_type: "FlushMetrics" }) -> PUT /actions
 ```
 
 The RawTree collector turns each metrics JSON object into `sandbox.firecracker.vmm.metrics`.

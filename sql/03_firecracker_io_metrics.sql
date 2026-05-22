@@ -1,12 +1,25 @@
 -- Replace <RUN_ID> with the run id printed by the rich example.
+WITH
+  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.read_bytes`)) AS rootfs_read_bytes_named,
+  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.write_bytes`)) AS rootfs_write_bytes_named,
+  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.read_count`)) AS rootfs_read_count_named,
+  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.write_count`)) AS rootfs_write_count_named,
+  toUInt64OrZero(toString(`firecracker.metrics.block_root_drive.read_bytes`)) AS rootfs_read_bytes_sdk_default,
+  toUInt64OrZero(toString(`firecracker.metrics.block_root_drive.write_bytes`)) AS rootfs_write_bytes_sdk_default,
+  toUInt64OrZero(toString(`firecracker.metrics.block_root_drive.read_count`)) AS rootfs_read_count_sdk_default,
+  toUInt64OrZero(toString(`firecracker.metrics.block_root_drive.write_count`)) AS rootfs_write_count_sdk_default,
+  toUInt64OrZero(toString(`firecracker.metrics.block.read_bytes`)) AS rootfs_read_bytes_aggregate,
+  toUInt64OrZero(toString(`firecracker.metrics.block.write_bytes`)) AS rootfs_write_bytes_aggregate,
+  toUInt64OrZero(toString(`firecracker.metrics.block.read_count`)) AS rootfs_read_count_aggregate,
+  toUInt64OrZero(toString(`firecracker.metrics.block.write_count`)) AS rootfs_write_count_aggregate
 SELECT
   parseDateTime64BestEffort(toString(sampled_at), 3) AS ts,
-  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.read_bytes`)) AS rootfs_read_bytes,
-  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.write_bytes`)) AS rootfs_write_bytes,
+  if(rootfs_read_bytes_named > 0, rootfs_read_bytes_named, if(rootfs_read_bytes_sdk_default > 0, rootfs_read_bytes_sdk_default, rootfs_read_bytes_aggregate)) AS rootfs_read_bytes,
+  if(rootfs_write_bytes_named > 0, rootfs_write_bytes_named, if(rootfs_write_bytes_sdk_default > 0, rootfs_write_bytes_sdk_default, rootfs_write_bytes_aggregate)) AS rootfs_write_bytes,
   round(rootfs_read_bytes / 1048576, 2) AS rootfs_read_mib,
   round(rootfs_write_bytes / 1048576, 2) AS rootfs_write_mib,
-  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.read_count`)) AS rootfs_read_count,
-  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.write_count`)) AS rootfs_write_count,
+  if(rootfs_read_count_named > 0, rootfs_read_count_named, if(rootfs_read_count_sdk_default > 0, rootfs_read_count_sdk_default, rootfs_read_count_aggregate)) AS rootfs_read_count,
+  if(rootfs_write_count_named > 0, rootfs_write_count_named, if(rootfs_write_count_sdk_default > 0, rootfs_write_count_sdk_default, rootfs_write_count_aggregate)) AS rootfs_write_count,
   toUInt64OrZero(toString(`firecracker.metrics.vcpu.exit_io_in`))
     + toUInt64OrZero(toString(`firecracker.metrics.vcpu.exit_io_out`))
     + toUInt64OrZero(toString(`firecracker.metrics.vcpu.exit_mmio_read`))

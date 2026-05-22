@@ -63,10 +63,17 @@ LIMIT 100;
 Extract useful metrics from the nested Firecracker object at query time:
 
 ```sql
+WITH
+  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.read_bytes`)) AS rootfs_read_bytes_named,
+  toUInt64OrZero(toString(`firecracker.metrics.block_root_drive.read_bytes`)) AS rootfs_read_bytes_sdk_default,
+  toUInt64OrZero(toString(`firecracker.metrics.block.read_bytes`)) AS rootfs_read_bytes_aggregate,
+  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.write_bytes`)) AS rootfs_write_bytes_named,
+  toUInt64OrZero(toString(`firecracker.metrics.block_root_drive.write_bytes`)) AS rootfs_write_bytes_sdk_default,
+  toUInt64OrZero(toString(`firecracker.metrics.block.write_bytes`)) AS rootfs_write_bytes_aggregate
 SELECT
   toString(run_id) AS run,
-  max(toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.read_bytes`))) AS rootfs_read_bytes,
-  max(toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.write_bytes`))) AS rootfs_write_bytes,
+  max(if(rootfs_read_bytes_named > 0, rootfs_read_bytes_named, if(rootfs_read_bytes_sdk_default > 0, rootfs_read_bytes_sdk_default, rootfs_read_bytes_aggregate))) AS rootfs_read_bytes,
+  max(if(rootfs_write_bytes_named > 0, rootfs_write_bytes_named, if(rootfs_write_bytes_sdk_default > 0, rootfs_write_bytes_sdk_default, rootfs_write_bytes_aggregate))) AS rootfs_write_bytes,
   max(
     toUInt64OrZero(toString(`firecracker.metrics.vcpu.exit_io_in`))
     + toUInt64OrZero(toString(`firecracker.metrics.vcpu.exit_io_out`))

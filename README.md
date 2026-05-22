@@ -2,7 +2,7 @@
 
 Reference implementation for adding RawTree observability to a sandbox platform that creates Firecracker microVMs internally.
 
-This repository is intentionally provider-side. It does not create a competing sandbox SDK, it does not ask sandbox users to wrap their sandbox objects, and it does not inject a RawTree guest agent. It only uses the Firecracker control API plus provider lifecycle events.
+This repository is intentionally provider-side. It does not create a competing sandbox SDK, it does not ask sandbox users to wrap their sandbox objects, and it does not inject a RawTree guest agent. It uses the official `firecracker-go-sdk` to drive the Firecracker control API, then pushes Firecracker-native logs, Firecracker-native metrics, provider lifecycle events, and host-side hypervisor samples to RawTree.
 
 The model is:
 
@@ -40,9 +40,9 @@ Firecracker orchestrator
   |
   | 2. starts RawTree host collector with provider metadata
   | 3. creates host files for Firecracker logger and metrics
-  | 4. configures Firecracker /logger and /metrics
-  | 5. configures kernel, rootfs, machine, and optional network
-  | 6. starts the microVM
+  | 4. builds firecracker-go-sdk Config
+  | 5. SDK configures logger, metrics, kernel, rootfs, machine, and optional network
+  | 6. SDK starts the microVM
   | 7. samples Firecracker host PID and cgroup
   v
 Firecracker VMM
@@ -74,8 +74,7 @@ The provider's internal platform code changes:
 ```txt
 before Firecracker InstanceStart:
   start RawTree host collector
-  configure Firecracker /logger
-  configure Firecracker /metrics
+  configure Firecracker logger and metrics paths through firecracker-go-sdk
   configure the normal microVM
 
 while the VM runs:
@@ -92,31 +91,65 @@ when the provider stops the VM:
 ## What This Repository Contains
 
 ```txt
-src/
-  orchestrator.ts                  # internal provider launch flow
-  firecracker-api.ts               # direct Firecracker Unix-socket API calls
-  firecracker-native-collector.ts  # Firecracker log/metrics files -> RawTree events
-  hypervisor-sampler.ts            # host process/cgroup metrics -> RawTree events
-  host-collector.ts                # RawTree writer with provider metadata enrichment
-  types.ts
+rawtree_firecracker_observability.go
+                                  # CLI wrapper around the provider launch flow
+
+internal/
+  orchestrator.go                 # Linux/KVM Firecracker launch via firecracker-go-sdk
+  firecracker_native.go           # Firecracker log/metrics files -> RawTree events
+  hypervisor_sampler.go           # host process/cgroup metrics -> RawTree events
+  collector.go                    # RawTree writer with provider metadata enrichment
+  types.go
+
+scripts/
+  prepare-rich-rootfs.sh          # installs the demo workload into a rootfs copy
+  generate-rich-report.mjs        # queries RawTree SQL views and writes an HTML report
+
+sql/
+  *.sql                           # SQL views for counts, timelines, CPU, memory, IO, logs
 ```
 
 This is a reference design for provider integration. A production provider would usually wire these pieces into its existing control plane rather than run this CLI directly.
 
 ## Firecracker API Calls
 
-This project does not use a Firecracker SDK. Firecracker exposes an HTTP API over a Unix socket.
+This project uses `github.com/firecracker-microvm/firecracker-go-sdk`. The SDK still talks to the real Firecracker HTTP API over the Unix socket, but it removes the need for us to hand-roll request ordering, model structs, socket clients, process startup, and sync actions.
 
-The orchestrator starts Firecracker:
+The SDK-backed orchestrator builds a `firecracker.Config`:
 
-```ts
-spawn("/usr/local/bin/firecracker", [
-  "--api-sock",
-  "/tmp/firecracker.socket",
-]);
+```go
+cfg := firecracker.Config{
+  SocketPath:      paths.APISocketPath,
+  LogPath:         paths.FirecrackerLogPath,
+  LogLevel:        "Info",
+  MetricsPath:     paths.FirecrackerMetricsPath,
+  KernelImagePath: request.Firecracker.Kernel,
+  KernelArgs:      bootArgs(request.Firecracker),
+  Drives: firecracker.NewDrivesBuilder(paths.RootFSCopyPath).
+    WithRootDrive(paths.RootFSCopyPath, firecracker.WithDriveID("rootfs")).
+    Build(),
+  MachineCfg: models.MachineConfiguration{
+    MemSizeMib: firecracker.Int64(request.Firecracker.MemMiB),
+    VcpuCount:  firecracker.Int64(request.Firecracker.VCPUCount),
+    Smt:        firecracker.Bool(false),
+  },
+}
 ```
 
-Then it calls the real Firecracker API:
+Then it creates and starts a machine:
+
+```go
+machine, err := firecracker.NewMachine(
+  ctx,
+  cfg,
+  firecracker.WithProcessRunner(cmd),
+  firecracker.WithLogger(logger),
+  moveCgroup,
+)
+err = machine.Start(ctx)
+```
+
+Under the hood, the SDK configures the same Firecracker API surfaces:
 
 ```txt
 PUT /logger
@@ -127,6 +160,16 @@ PUT /drives/rootfs
 PUT /network-interfaces/eth0   # optional
 PUT /actions { "action_type": "InstanceStart" }
 PUT /actions { "action_type": "FlushMetrics" }
+```
+
+The final metrics flush also goes through the SDK client:
+
+```go
+client := firecracker.NewClient(socketPath, logger, false)
+action := models.InstanceActionInfoActionTypeFlushMetrics
+_, err := client.CreateSyncAction(ctx, &models.InstanceActionInfo{
+  ActionType: &action,
+})
 ```
 
 Logger configuration:
@@ -158,10 +201,10 @@ Startup:
 2. Provider allocates `sandbox_id` and `run_id`.
 3. Provider starts the RawTree host collector.
 4. Provider creates host files for Firecracker logs and metrics.
-5. Provider starts the Firecracker process with an API socket.
-6. Provider calls `/logger` and `/metrics`.
-7. Provider configures the machine, boot source, rootfs, and optional network.
-8. Provider starts the microVM with `InstanceStart`.
+5. Provider builds `firecracker.Config` with log, metrics, machine, boot, drive, and optional network settings.
+6. Provider creates a `firecracker.Machine`.
+7. The SDK starts Firecracker with the API socket and applies the config.
+8. The SDK starts the microVM with `InstanceStart`.
 
 Shutdown:
 
@@ -226,11 +269,12 @@ Those should come from the provider's existing sandbox control plane if it alrea
 Host:
 
 - Linux host with KVM and access to `/dev/kvm`
+- Go 1.22+
+- Node.js 22+ for HTML report generation
 - Firecracker binary
 - kernel image compatible with Firecracker
 - rootfs image compatible with the kernel
 - outbound network access from the host collector to RawTree
-- Node.js 22+
 
 For AWS testing, use an EC2 `.metal` instance type, such as `c5.metal`. Standard
 virtualized EC2 instances can boot Linux, but they usually do not expose
@@ -253,7 +297,7 @@ For local development on macOS, use `--dry-run`. A real Firecracker boot require
 ## Install
 
 ```bash
-npm install
+go mod download
 ```
 
 Copy the env example if you want to run against RawTree:
@@ -273,13 +317,17 @@ export RAWTREE_API_KEY=rt_...
 Dry run does not require Linux, KVM, Firecracker, or a real rootfs. It prints the platform integration plan.
 
 ```bash
-npm run dry-run
+go run . \
+  --dry-run \
+  --kernel /var/lib/firecracker/vmlinux \
+  --rootfs /var/lib/firecracker/rootfs.ext4
 ```
 
 Or pass explicit values:
 
 ```bash
-npm run start -- --dry-run \
+go run . \
+  --dry-run \
   --kernel /var/lib/firecracker/vmlinux \
   --rootfs /var/lib/firecracker/rootfs.ext4 \
   --metadata provider=example \
@@ -291,7 +339,7 @@ npm run start -- --dry-run \
 Run this on a Linux host with KVM:
 
 ```bash
-sudo -E npm run start -- \
+sudo -E go run . \
   --firecracker /usr/local/bin/firecracker \
   --kernel /var/lib/firecracker/vmlinux \
   --rootfs /var/lib/firecracker/rootfs.ext4 \
@@ -299,12 +347,12 @@ sudo -E npm run start -- \
   --metadata environment=poc
 ```
 
-The CLI also accepts `--api-key`, but passing the key through `RAWTREE_API_KEY` avoids printing it in package-manager command echoes.
+The CLI also accepts `--api-key`, but passing the key through `RAWTREE_API_KEY` avoids printing it in shell command arguments.
 
 Optional TAP networking:
 
 ```bash
-sudo -E npm run start -- \
+sudo -E go run . \
   --firecracker /usr/local/bin/firecracker \
   --kernel /var/lib/firecracker/vmlinux \
   --rootfs /var/lib/firecracker/rootfs.ext4 \
@@ -326,7 +374,7 @@ Run it on a Linux host with KVM:
 
 ```bash
 export RAWTREE_API_KEY=rt_...
-npm run rich-example
+bash examples/rich-firecracker-workload.sh
 ```
 
 What this produces:
@@ -348,7 +396,15 @@ rtree query --sql "$SQL"
 Generate a standalone HTML report from those SQL-backed views:
 
 ```bash
-RAWTREE_API_KEY=rt_... npm run rich-report -- "$RUN_ID"
+RAWTREE_API_KEY=rt_... node scripts/generate-rich-report.mjs "$RUN_ID"
+```
+
+Run the local checks:
+
+```bash
+go test ./...
+GOOS=linux GOARCH=amd64 go test ./...
+node --check scripts/generate-rich-report.mjs
 ```
 
 Useful files:
@@ -409,6 +465,9 @@ Firecracker metrics:
     "metrics": {
       "block_rootfs": {
         "read_bytes": 41401344
+      },
+      "block": {
+        "read_bytes": 41401344
       }
     }
   },
@@ -420,12 +479,25 @@ Firecracker metrics:
 Query useful counters from the nested metrics object:
 
 ```sql
+WITH
+  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.read_bytes`)) AS rootfs_read_bytes_named,
+  toUInt64OrZero(toString(`firecracker.metrics.block_root_drive.read_bytes`)) AS rootfs_read_bytes_sdk_default,
+  toUInt64OrZero(toString(`firecracker.metrics.block.read_bytes`)) AS rootfs_read_bytes_aggregate,
+  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.write_bytes`)) AS rootfs_write_bytes_named,
+  toUInt64OrZero(toString(`firecracker.metrics.block_root_drive.write_bytes`)) AS rootfs_write_bytes_sdk_default,
+  toUInt64OrZero(toString(`firecracker.metrics.block.write_bytes`)) AS rootfs_write_bytes_aggregate,
+  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.read_count`)) AS rootfs_read_count_named,
+  toUInt64OrZero(toString(`firecracker.metrics.block_root_drive.read_count`)) AS rootfs_read_count_sdk_default,
+  toUInt64OrZero(toString(`firecracker.metrics.block.read_count`)) AS rootfs_read_count_aggregate,
+  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.write_count`)) AS rootfs_write_count_named,
+  toUInt64OrZero(toString(`firecracker.metrics.block_root_drive.write_count`)) AS rootfs_write_count_sdk_default,
+  toUInt64OrZero(toString(`firecracker.metrics.block.write_count`)) AS rootfs_write_count_aggregate
 SELECT
   event_time,
-  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.read_bytes`)) AS rootfs_read_bytes,
-  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.write_bytes`)) AS rootfs_write_bytes,
-  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.read_count`)) AS rootfs_read_count,
-  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.write_count`)) AS rootfs_write_count,
+  if(rootfs_read_bytes_named > 0, rootfs_read_bytes_named, if(rootfs_read_bytes_sdk_default > 0, rootfs_read_bytes_sdk_default, rootfs_read_bytes_aggregate)) AS rootfs_read_bytes,
+  if(rootfs_write_bytes_named > 0, rootfs_write_bytes_named, if(rootfs_write_bytes_sdk_default > 0, rootfs_write_bytes_sdk_default, rootfs_write_bytes_aggregate)) AS rootfs_write_bytes,
+  if(rootfs_read_count_named > 0, rootfs_read_count_named, if(rootfs_read_count_sdk_default > 0, rootfs_read_count_sdk_default, rootfs_read_count_aggregate)) AS rootfs_read_count,
+  if(rootfs_write_count_named > 0, rootfs_write_count_named, if(rootfs_write_count_sdk_default > 0, rootfs_write_count_sdk_default, rootfs_write_count_aggregate)) AS rootfs_write_count,
   toUInt64OrZero(toString(`firecracker.metrics.vcpu.exit_io_in`))
     + toUInt64OrZero(toString(`firecracker.metrics.vcpu.exit_io_out`))
     + toUInt64OrZero(toString(`firecracker.metrics.vcpu.exit_mmio_read`))

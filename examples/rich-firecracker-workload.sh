@@ -18,6 +18,7 @@ BASE_ROOTFS="${BASE_ROOTFS:-/var/lib/firecracker/rootfs.ext4}"
 RICH_ROOTFS="${RICH_ROOTFS:-/var/lib/firecracker/rootfs-rich.ext4}"
 KERNEL="${KERNEL:-/var/lib/firecracker/vmlinux}"
 FIRECRACKER="${FIRECRACKER:-/usr/local/bin/firecracker}"
+GO_BIN="${GO_BIN:-$(command -v go)}"
 TABLE="${RAWTREE_SANDBOX_TABLE:-sandbox_events}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 CGROUP_PATH="${CGROUP_PATH:-rawtree-rich-${STAMP}}"
@@ -38,7 +39,7 @@ echo "table=$TABLE"
 echo "cgroup_path=$CGROUP_PATH"
 
 if [ "$(id -u)" -eq 0 ]; then
-  env RAWTREE_API_KEY="$API_KEY" npm run start -- \
+  env RAWTREE_API_KEY="$API_KEY" "$GO_BIN" run . \
     --firecracker "$FIRECRACKER" \
     --kernel "$KERNEL" \
     --rootfs "$RICH_ROOTFS" \
@@ -54,7 +55,7 @@ if [ "$(id -u)" -eq 0 ]; then
     --metadata workload=cpu-disk \
     --metadata scenario=rich-example
 else
-  sudo -E env RAWTREE_API_KEY="$API_KEY" npm run start -- \
+  sudo -E env RAWTREE_API_KEY="$API_KEY" "$GO_BIN" run . \
     --firecracker "$FIRECRACKER" \
     --kernel "$KERNEL" \
     --rootfs "$RICH_ROOTFS" \
