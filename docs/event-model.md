@@ -2,7 +2,7 @@
 
 All events are JSON objects inserted into a RawTree table. The host collector enriches every event with common provider fields before writing it.
 
-This reference only emits provider lifecycle and Firecracker-native events. It does not emit guest agent events.
+This reference emits provider lifecycle events, Firecracker-native events, and host-side hypervisor samples. It does not emit guest agent events.
 
 ## Common Fields
 
@@ -14,9 +14,10 @@ This reference only emits provider lifecycle and Firecracker-native events. It d
 | `provider` | Provider name passed to the orchestrator. |
 | `sandbox_id` | Provider-owned sandbox id. |
 | `run_id` | RawTree run id for this VM launch. |
-| `source` | Event source, such as `firecracker_host_collector`, `firecracker_vmm_logger`, or `firecracker_vmm_metrics`. |
+| `source` | Event source, such as `firecracker_host_collector`, `firecracker_vmm_logger`, `firecracker_vmm_metrics`, or `host_hypervisor_sampler`. |
 | `status` | Usually `started`, `success`, or `error`. |
-| `rawtree_metadata_json` | JSON string with provider metadata. |
+| `sampled_at` | ISO timestamp for when the source measurement, log line, or metric was observed. |
+| `metadata` | Nested provider metadata object. |
 
 ## Provider Lifecycle Events
 
@@ -34,6 +35,13 @@ This reference only emits provider lifecycle and Firecracker-native events. It d
 | `sandbox.firecracker.vmm.log` | One Firecracker logger line from the host log file. |
 | `sandbox.firecracker.vmm.metrics` | One Firecracker metrics JSON object from the host metrics file. |
 
+## Hypervisor Events
+
+| Event | Meaning |
+| --- | --- |
+| `sandbox.hypervisor.sample` | One raw host-side sample for the Firecracker process and cgroup. |
+| `sandbox.hypervisor.sample.failed` | The host-side sampler could not read the process or cgroup. |
+
 ## Example Query
 
 ```sql
@@ -44,29 +52,47 @@ SELECT
   event_type,
   source,
   status,
-  firecracker_log_line,
-  firecracker_metrics_json
+  `firecracker.log.line`,
+  `firecracker.metrics.block_rootfs.read_bytes`,
+  `hypervisor.process.status.vm_rss_bytes`
 FROM sandbox_events
 ORDER BY event_time DESC
 LIMIT 100;
 ```
 
-Extract useful metrics from the raw Firecracker JSON at query time:
+Extract useful metrics from the nested Firecracker object at query time:
 
 ```sql
 SELECT
   toString(run_id) AS run,
-  max(JSONExtractUInt(toString(firecracker_metrics_json), 'block_rootfs', 'read_bytes')) AS rootfs_read_bytes,
-  max(JSONExtractUInt(toString(firecracker_metrics_json), 'block_rootfs', 'write_bytes')) AS rootfs_write_bytes,
+  max(toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.read_bytes`))) AS rootfs_read_bytes,
+  max(toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.write_bytes`))) AS rootfs_write_bytes,
   max(
-    JSONExtractUInt(toString(firecracker_metrics_json), 'vcpu', 'exit_io_in')
-    + JSONExtractUInt(toString(firecracker_metrics_json), 'vcpu', 'exit_io_out')
-    + JSONExtractUInt(toString(firecracker_metrics_json), 'vcpu', 'exit_mmio_read')
-    + JSONExtractUInt(toString(firecracker_metrics_json), 'vcpu', 'exit_mmio_write')
+    toUInt64OrZero(toString(`firecracker.metrics.vcpu.exit_io_in`))
+    + toUInt64OrZero(toString(`firecracker.metrics.vcpu.exit_io_out`))
+    + toUInt64OrZero(toString(`firecracker.metrics.vcpu.exit_mmio_read`))
+    + toUInt64OrZero(toString(`firecracker.metrics.vcpu.exit_mmio_write`))
   ) AS vcpu_exits,
-  max(JSONExtractUInt(toString(firecracker_metrics_json), 'uart', 'write_count')) AS uart_writes
+  max(toUInt64OrZero(toString(`firecracker.metrics.uart.write_count`))) AS uart_writes
 FROM sandbox_events
 WHERE toString(event_type) = 'sandbox.firecracker.vmm.metrics'
 GROUP BY run
 ORDER BY rootfs_read_bytes DESC;
+```
+
+Extract host-side CPU and memory from the nested hypervisor object:
+
+```sql
+SELECT
+  toString(run_id) AS run,
+  event_time,
+  toUInt64OrZero(toString(`hypervisor.process.status.vm_rss_bytes`)) AS firecracker_rss_bytes,
+  toUInt64OrZero(toString(`hypervisor.process.stat.cpu_total_ticks`)) AS firecracker_cpu_ticks,
+  toUInt64OrZero(toString(`hypervisor.process.fd_count`)) AS firecracker_fd_count,
+  toUInt64OrZero(toString(`hypervisor.cgroup.memory_current_bytes`)) AS cgroup_memory_current_bytes,
+  toUInt64OrZero(toString(`hypervisor.cgroup.cpu_stat.usage_usec`)) AS cgroup_cpu_usage_usec
+FROM sandbox_events
+WHERE toString(event_type) = 'sandbox.hypervisor.sample'
+ORDER BY event_time DESC
+LIMIT 100;
 ```

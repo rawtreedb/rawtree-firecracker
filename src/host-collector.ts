@@ -17,8 +17,8 @@ const MAX_BATCH_SIZE = 50;
 
 export async function startHostCollector(options: HostCollectorOptions): Promise<HostCollector> {
   const pending: RawTreeEvent[] = [];
-  let flushing = false;
   let closed = false;
+  let currentFlush: Promise<void> | undefined;
 
   const interval = setInterval(() => {
     void flush().catch((error) => {
@@ -35,23 +35,19 @@ export async function startHostCollector(options: HostCollectorOptions): Promise
   }
 
   async function flush(): Promise<void> {
-    if (flushing || pending.length === 0) {
+    if (currentFlush) {
+      return currentFlush;
+    }
+
+    if (pending.length === 0) {
       return;
     }
 
-    flushing = true;
-    const events = pending.splice(0, pending.length);
+    currentFlush = drainPending().finally(() => {
+      currentFlush = undefined;
+    });
 
-    try {
-      for (const event of events) {
-        await writeRawTreeEvent(event, options.request);
-      }
-    } catch (error) {
-      pending.unshift(...events);
-      throw error;
-    } finally {
-      flushing = false;
-    }
+    return currentFlush;
   }
 
   return {
@@ -69,16 +65,34 @@ export async function startHostCollector(options: HostCollectorOptions): Promise
     flush,
     record,
   };
+
+  async function drainPending(): Promise<void> {
+    while (pending.length > 0) {
+      const events = pending.splice(0, pending.length);
+
+      try {
+        for (const event of events) {
+          await writeRawTreeEvent(event, options.request);
+        }
+      } catch (error) {
+        pending.unshift(...events);
+        throw error;
+      }
+    }
+  }
 }
 
 function enrichEvent(event: RawTreeEvent, request: SandboxLaunchRequest): RawTreeEvent {
+  const eventTime = event.event_time ?? new Date().toISOString();
+
   return {
     ...event,
-    event_time: event.event_time ?? new Date().toISOString(),
+    event_time: eventTime,
     event_id: event.event_id ?? randomUUID(),
+    metadata: event.metadata ?? request.metadata,
     provider: request.provider,
-    rawtree_metadata_json: JSON.stringify(request.metadata),
     run_id: request.runId,
+    sampled_at: event.sampled_at ?? eventTime,
     sandbox_id: request.sandboxId,
     source: event.source ?? "firecracker_host_collector",
   };

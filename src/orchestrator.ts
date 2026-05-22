@@ -10,6 +10,7 @@ import {
   prepareFirecrackerOutputFiles,
 } from "./firecracker-native-collector.js";
 import { startHostCollector, type HostCollector } from "./host-collector.js";
+import { startHypervisorSampler, type HypervisorSampler } from "./hypervisor-sampler.js";
 import type { FirecrackerConfig, RuntimePaths, SandboxLaunchRequest } from "./types.js";
 
 type CliOptions = {
@@ -19,6 +20,7 @@ type CliOptions = {
   dryRun: boolean;
   firecracker: string;
   guestMac?: string;
+  hypervisorSampleIntervalMs: number;
   kernel: string;
   memMiB: number;
   metadata: Record<string, string>;
@@ -39,6 +41,7 @@ const DEFAULT_BASE_URL = "https://api.rawtree.com";
 const DEFAULT_PROVIDER = "firecracker-sandbox-provider";
 const DEFAULT_TABLE = "sandbox_events";
 const DEFAULT_RUN_TIMEOUT_MS = 30_000;
+const DEFAULT_HYPERVISOR_SAMPLE_INTERVAL_MS = 1_000;
 const FIRECRACKER_EXIT_TIMEOUT_MS = 5_000;
 
 async function main(): Promise<void> {
@@ -64,6 +67,7 @@ async function launchObservedSandbox(request: SandboxLaunchRequest): Promise<voi
   const paths = await runtimePaths(request.sandboxId);
   let firecracker: ChildProcess | undefined;
   let collector: HostCollector | undefined;
+  let hypervisorSampler: HypervisorSampler | undefined;
 
   try {
     await fs.copyFile(request.rootfs, paths.rootfsCopyPath);
@@ -80,7 +84,15 @@ async function launchObservedSandbox(request: SandboxLaunchRequest): Promise<voi
     firecracker = spawn(request.firecracker.binary, ["--api-sock", paths.apiSocketPath], {
       stdio: ["ignore", "ignore", "inherit"],
     });
+    if (!firecracker.pid) {
+      throw new Error("Firecracker process started without a host PID.");
+    }
     const firecrackerExit = onceExit(firecracker);
+    hypervisorSampler = startHypervisorSampler({
+      collector,
+      intervalMs: request.hypervisorSampleIntervalMs,
+      pid: firecracker.pid,
+    });
 
     await waitForSocket(paths.apiSocketPath);
     const fc = firecrackerClient(paths.apiSocketPath);
@@ -105,6 +117,7 @@ async function launchObservedSandbox(request: SandboxLaunchRequest): Promise<voi
       boot_args: request.firecracker.bootArgs ?? DEFAULT_BOOT_ARGS,
       firecracker_log_path: paths.firecrackerLogPath,
       firecracker_metrics_path: paths.firecrackerMetricsPath,
+      firecracker_pid: firecracker.pid,
       workspace_dir: paths.workspaceDir,
     });
 
@@ -121,10 +134,12 @@ async function launchObservedSandbox(request: SandboxLaunchRequest): Promise<voi
     ]);
 
     if (stopResult.reason !== "firecracker_exit") {
+      await hypervisorSampler.sample();
       await fc.put("/actions", { action_type: "FlushMetrics" }).catch(() => undefined);
       stopResult.exitCode = await terminateFirecracker(firecracker, firecrackerExit);
     }
 
+    await hypervisorSampler.stop();
     await emitFirecrackerNativeEvents(paths, collector);
 
     const status = stopResult.reason === "firecracker_exit" && stopResult.exitCode !== 0 ? "error" : "success";
@@ -150,11 +165,14 @@ async function launchObservedSandbox(request: SandboxLaunchRequest): Promise<voi
 
     throw error;
   } finally {
+    await hypervisorSampler?.stop();
+
     if (firecracker) {
       firecracker.kill("SIGTERM");
     }
 
     await collector?.close();
+    await fs.rm(paths.workspaceDir, { force: true, recursive: true }).catch(() => undefined);
   }
 }
 
@@ -188,6 +206,7 @@ function sandboxLaunchRequestFromOptions(options: CliOptions): SandboxLaunchRequ
       table: options.table,
     },
     rootfs: options.rootfs,
+    hypervisorSampleIntervalMs: options.hypervisorSampleIntervalMs,
     runId: `rt_firecracker_sandbox_run_${randomUUID()}`,
     runTimeoutMs: options.runTimeoutMs,
     sandboxId: options.sandboxId,
@@ -221,6 +240,10 @@ function dryRunPlan(request: SandboxLaunchRequest): Record<string, unknown> {
     firecracker_native_outputs: {
       logger: "Firecracker writes VMM logs to a host file configured through /logger.",
       metrics: "Firecracker writes VMM/device metrics JSON to a host file configured through /metrics.",
+    },
+    hypervisor_samples: {
+      interval_ms: request.hypervisorSampleIntervalMs,
+      source: "/proc/<firecracker-pid> and cgroup v2 files on the host",
     },
     metadata: request.metadata,
     provider: request.provider,
@@ -340,6 +363,11 @@ function parseArgs(args: string[]): ParsedArgs {
     baseUrl: values.get("base-url") ?? process.env.RAWTREE_BASE_URL ?? DEFAULT_BASE_URL,
     dryRun,
     firecracker: values.get("firecracker") ?? "firecracker",
+    hypervisorSampleIntervalMs: numberOption(
+      values,
+      "hypervisor-sample-interval-ms",
+      DEFAULT_HYPERVISOR_SAMPLE_INTERVAL_MS,
+    ),
     kernel,
     memMiB: numberOption(values, "mem-mib", 512),
     metadata,
@@ -422,6 +450,8 @@ function usage(): string {
     "  --boot-args <args>       Kernel boot args, default: " + DEFAULT_BOOT_ARGS,
     "  --dry-run                Print the provider integration plan without starting Firecracker",
     "  --guest-mac <mac>        Guest MAC for optional TAP device",
+    "  --hypervisor-sample-interval-ms <n>",
+    "                           Host process/cgroup sample interval, default 1000",
     "  --mem-mib <n>            Memory in MiB, default 512",
     "  --metadata <key=value>   Provider metadata; can be passed multiple times",
     "  --provider <name>        Provider name",

@@ -43,14 +43,15 @@ Firecracker orchestrator
   | 4. configures Firecracker /logger and /metrics
   | 5. configures kernel, rootfs, machine, and optional network
   | 6. starts the microVM
+  | 7. samples Firecracker host PID and cgroup
   v
 Firecracker VMM
   |
-  | 7. writes logs and metrics on the host
+  | 8. writes logs and metrics on the host
   v
 RawTree host collector
   |
-  | 8. emits provider lifecycle, VMM log, and VMM metric events
+  | 9. emits provider lifecycle, hypervisor sample, VMM log, and VMM metric events
   v
 RawTree API
 ```
@@ -79,6 +80,7 @@ before Firecracker InstanceStart:
 
 while the VM runs:
   keep provider lifecycle correlated by sandbox_id and run_id
+  sample host process/cgroup CPU and memory for the Firecracker process
 
 when the provider stops the VM:
   call FlushMetrics
@@ -94,6 +96,7 @@ src/
   orchestrator.ts                  # internal provider launch flow
   firecracker-api.ts               # direct Firecracker Unix-socket API calls
   firecracker-native-collector.ts  # Firecracker log/metrics files -> RawTree events
+  hypervisor-sampler.ts            # host process/cgroup metrics -> RawTree events
   host-collector.ts                # RawTree writer with provider metadata enrichment
   types.ts
 ```
@@ -193,6 +196,16 @@ Firecracker metrics events:
 - sandbox id and run id
 - provider metadata
 
+Hypervisor sample events:
+
+- raw host-side Firecracker process and cgroup JSON
+- process RSS, virtual size, CPU ticks, file descriptor count, context switches, and `/proc/<pid>/io`
+- cgroup v2 CPU usage and memory usage when available
+- sandbox id and run id
+- provider metadata
+
+In this standalone demo, cgroup values reflect whatever cgroup the Firecracker process runs inside. For production-quality per-sandbox CPU and memory, place each microVM in its own provider-owned cgroup and sample that cgroup. The process RSS fields are still specific to the Firecracker process.
+
 ## What We Do Not Collect
 
 Because this version only uses Firecracker APIs, it does not automatically observe arbitrary activity inside the guest OS:
@@ -203,6 +216,8 @@ Because this version only uses Firecracker APIs, it does not automatically obser
 - stdout/stderr from the workload
 - exact HTTP URLs or TLS payloads
 - guest process memory by command
+
+It does sample the host Firecracker process and cgroup. That gives provider-style hypervisor/process telemetry, not per-process memory inside the guest OS.
 
 Those should come from the provider's existing sandbox control plane if it already has exec/files/logs APIs. RawTree can ingest those provider-native events too, but this repo intentionally keeps the Firecracker example limited to Firecracker-native APIs.
 
@@ -216,6 +231,16 @@ Host:
 - rootfs image compatible with the kernel
 - outbound network access from the host collector to RawTree
 - Node.js 22+
+
+For AWS testing, use an EC2 `.metal` instance type, such as `c5.metal`. Standard
+virtualized EC2 instances can boot Linux, but they usually do not expose
+`/dev/kvm`, so Firecracker cannot start a real microVM there. The setup check
+should include:
+
+```bash
+ls -l /dev/kvm
+[ -r /dev/kvm ] && [ -w /dev/kvm ] && echo "KVM ready"
+```
 
 Guest rootfs:
 
@@ -297,12 +322,16 @@ Provider lifecycle:
 {
   "event_type": "sandbox.firecracker.provider.vm.started",
   "event_time": "2026-05-21T12:00:00.000Z",
+  "sampled_at": "2026-05-21T12:00:00.000Z",
   "provider": "firecracker-sandbox-provider",
   "sandbox_id": "sbx_123",
   "run_id": "rt_firecracker_sandbox_run_456",
   "source": "firecracker_host_collector",
   "boot_args": "console=ttyS0 root=/dev/vda rw reboot=k panic=1 pci=off",
-  "rawtree_metadata_json": "{\"provider\":\"example\",\"environment\":\"poc\"}"
+  "metadata": {
+    "provider": "example",
+    "environment": "poc"
+  }
 }
 ```
 
@@ -311,8 +340,13 @@ Firecracker log:
 ```json
 {
   "event_type": "sandbox.firecracker.vmm.log",
+  "sampled_at": "2026-05-21T12:00:00.000Z",
   "source": "firecracker_vmm_logger",
-  "firecracker_log_line": "2026-05-21T12:00:00 [anonymous-instance:main] Running Firecracker...",
+  "firecracker": {
+    "log": {
+      "line": "2026-05-21T12:00:00 [anonymous-instance:main] Running Firecracker..."
+    }
+  },
   "sandbox_id": "sbx_123",
   "run_id": "rt_firecracker_sandbox_run_456"
 }
@@ -323,30 +357,84 @@ Firecracker metrics:
 ```json
 {
   "event_type": "sandbox.firecracker.vmm.metrics",
+  "sampled_at": "2026-05-21T12:00:00.000Z",
   "source": "firecracker_vmm_metrics",
-  "firecracker_metrics_json": "{\"block_rootfs\":{\"read_bytes\":41401344}}",
+  "firecracker": {
+    "metrics": {
+      "block_rootfs": {
+        "read_bytes": 41401344
+      }
+    }
+  },
   "sandbox_id": "sbx_123",
   "run_id": "rt_firecracker_sandbox_run_456"
 }
 ```
 
-Query useful counters from the raw metrics JSON:
+Query useful counters from the nested metrics object:
 
 ```sql
 SELECT
   event_time,
-  JSONExtractUInt(toString(firecracker_metrics_json), 'block_rootfs', 'read_bytes') AS rootfs_read_bytes,
-  JSONExtractUInt(toString(firecracker_metrics_json), 'block_rootfs', 'write_bytes') AS rootfs_write_bytes,
-  JSONExtractUInt(toString(firecracker_metrics_json), 'block_rootfs', 'read_count') AS rootfs_read_count,
-  JSONExtractUInt(toString(firecracker_metrics_json), 'block_rootfs', 'write_count') AS rootfs_write_count,
-  JSONExtractUInt(toString(firecracker_metrics_json), 'vcpu', 'exit_io_in')
-    + JSONExtractUInt(toString(firecracker_metrics_json), 'vcpu', 'exit_io_out')
-    + JSONExtractUInt(toString(firecracker_metrics_json), 'vcpu', 'exit_mmio_read')
-    + JSONExtractUInt(toString(firecracker_metrics_json), 'vcpu', 'exit_mmio_write') AS vcpu_exits,
-  JSONExtractUInt(toString(firecracker_metrics_json), 'uart', 'write_count') AS uart_writes,
-  JSONExtractUInt(toString(firecracker_metrics_json), 'interrupts', 'triggers') AS interrupts
+  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.read_bytes`)) AS rootfs_read_bytes,
+  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.write_bytes`)) AS rootfs_write_bytes,
+  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.read_count`)) AS rootfs_read_count,
+  toUInt64OrZero(toString(`firecracker.metrics.block_rootfs.write_count`)) AS rootfs_write_count,
+  toUInt64OrZero(toString(`firecracker.metrics.vcpu.exit_io_in`))
+    + toUInt64OrZero(toString(`firecracker.metrics.vcpu.exit_io_out`))
+    + toUInt64OrZero(toString(`firecracker.metrics.vcpu.exit_mmio_read`))
+    + toUInt64OrZero(toString(`firecracker.metrics.vcpu.exit_mmio_write`)) AS vcpu_exits,
+  toUInt64OrZero(toString(`firecracker.metrics.uart.write_count`)) AS uart_writes,
+  toUInt64OrZero(toString(`firecracker.metrics.interrupts.triggers`)) AS interrupts
 FROM sandbox_events
 WHERE toString(event_type) = 'sandbox.firecracker.vmm.metrics'
+ORDER BY event_time DESC
+LIMIT 100;
+```
+
+Hypervisor sample:
+
+```json
+{
+  "event_type": "sandbox.hypervisor.sample",
+  "sampled_at": "2026-05-21T12:00:00.000Z",
+  "source": "host_hypervisor_sampler",
+  "hypervisor": {
+    "pid": 1234,
+    "process": {
+      "fd_count": 33,
+      "status": {
+        "vm_rss_bytes": 14295040
+      },
+      "stat": {
+        "cpu_total_ticks": 149
+      }
+    },
+    "cgroup": {
+      "memory_current_bytes": 268435456,
+      "cpu_stat": {
+        "usage_usec": 4466298
+      }
+    }
+  },
+  "sandbox_id": "sbx_123",
+  "run_id": "rt_firecracker_sandbox_run_456"
+}
+```
+
+Query host-side CPU and memory from the nested hypervisor object:
+
+```sql
+SELECT
+  event_time,
+  toUInt64OrZero(toString(`hypervisor.process.status.vm_rss_bytes`)) AS firecracker_rss_bytes,
+  toUInt64OrZero(toString(`hypervisor.process.status.vm_size_bytes`)) AS firecracker_vm_size_bytes,
+  toUInt64OrZero(toString(`hypervisor.process.stat.cpu_total_ticks`)) AS firecracker_cpu_ticks,
+  toUInt64OrZero(toString(`hypervisor.process.fd_count`)) AS firecracker_fd_count,
+  toUInt64OrZero(toString(`hypervisor.cgroup.memory_current_bytes`)) AS cgroup_memory_current_bytes,
+  toUInt64OrZero(toString(`hypervisor.cgroup.cpu_stat.usage_usec`)) AS cgroup_cpu_usage_usec
+FROM sandbox_events
+WHERE toString(event_type) = 'sandbox.hypervisor.sample'
 ORDER BY event_time DESC
 LIMIT 100;
 ```
@@ -357,10 +445,11 @@ LIMIT 100;
 2. Start a host-side RawTree collector beside the Firecracker process.
 3. Configure Firecracker `/logger` with a per-sandbox host log path.
 4. Configure Firecracker `/metrics` with a per-sandbox host metrics path.
-5. Attach provider metadata such as team, project, region, runtime, image id, and sandbox id.
-6. Call `FlushMetrics` before stopping the VM when possible.
-7. Emit Firecracker logs and metrics to RawTree.
-8. Optionally also emit provider-native exec/files/stdout/stderr events if your platform already has them.
+5. Sample host-side hypervisor/process metrics for the Firecracker process or its cgroup.
+6. Attach provider metadata such as team, project, region, runtime, image id, and sandbox id.
+7. Call `FlushMetrics` before stopping the VM when possible.
+8. Emit Firecracker logs, Firecracker metrics, and hypervisor samples to RawTree.
+9. Optionally also emit provider-native exec/files/stdout/stderr events if your platform already has them.
 
 ## Production Notes
 
@@ -372,6 +461,7 @@ For production, likely next steps are:
 - bounded memory queue in host collector
 - batched RawTree inserts
 - retry/backoff and disk spill for collector failures
+- provider-owned cgroup isolation per sandbox
 - provider-specific redaction
 - explicit event schema versioning
 - optional ingestion of provider-native sandbox events

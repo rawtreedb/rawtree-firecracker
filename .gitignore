@@ -11,3 +11,4 @@ dist/
 *.socket
 *.ext4
 tmp/
+reports/

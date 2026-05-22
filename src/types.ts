@@ -20,6 +20,7 @@ export type SandboxLaunchRequest = {
   provider: string;
   rawtree: RawTreeConfig;
   rootfs: string;
+  hypervisorSampleIntervalMs: number;
   runId: string;
   runTimeoutMs: number;
   sandboxId: string;
@@ -33,14 +34,26 @@ export type RuntimePaths = {
   workspaceDir: string;
 };
 
+export type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JsonValue[]
+  | JsonObject;
+
+export type JsonObject = { [key: string]: JsonValue };
+
 export type RawTreeEvent = {
   event_id?: string;
   event_time?: string;
   event_type: string;
+  metadata?: Record<string, string>;
   provider?: string;
   run_id?: string;
+  sampled_at?: string;
   sandbox_id?: string;
   source?: string;
   status?: string;
-  [key: string]: string | number | boolean | null | undefined;
+  [key: string]: JsonValue | undefined;
 };
