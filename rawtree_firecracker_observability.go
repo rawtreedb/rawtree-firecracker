@@ -124,15 +124,16 @@ type createArgs struct {
 }
 
 type execArgs struct {
-	apiKey      string
-	baseURL     string
-	env         map[string]string
-	interactive bool
-	sandboxID   string
-	sudo        bool
-	table       string
-	workdir     string
-	argv        []string
+	apiKey            string
+	baseURL           string
+	env               map[string]string
+	interactive       bool
+	sandboxID         string
+	sudo              bool
+	suppressTelemetry bool
+	table             string
+	workdir           string
+	argv              []string
 }
 
 type stopArgs struct {
@@ -225,9 +226,10 @@ func runExec(argv []string) error {
 			Sudo:        args.sudo,
 			Workdir:     args.workdir,
 		},
-		Stdin:  interactiveReader(args.interactive),
-		Stdout: os.Stdout,
-		Stderr: os.Stderr,
+		Stdin:             interactiveReader(args.interactive),
+		Stdout:            os.Stdout,
+		Stderr:            os.Stderr,
+		SuppressTelemetry: args.suppressTelemetry,
 	})
 	if err != nil {
 		return err
@@ -583,6 +585,7 @@ func parseExecArgs(argv []string) execArgs {
 	flags.Var(env, "env", "Environment key=value; can be passed multiple times")
 	flags.BoolVar(&args.interactive, "interactive", false, "Attach stdin to the command")
 	flags.BoolVar(&args.sudo, "sudo", false, "Run through sudo when the guest agent is not already root")
+	flags.BoolVar(&args.suppressTelemetry, "suppress-telemetry", false, "Do not record telemetry for this exec; intended for provider setup commands")
 	flags.StringVar(&args.table, "table", envDefault("RAWTREE_SANDBOX_TABLE", defaultTable), "RawTree table")
 	flags.StringVar(&args.workdir, "workdir", "", "Working directory inside the sandbox")
 	_ = flags.Parse(argv)

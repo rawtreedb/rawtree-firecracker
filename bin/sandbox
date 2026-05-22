@@ -1,0 +1,407 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+INSTANCE_ENV="${RAWTREE_FIRECRACKER_INSTANCE_ENV:-/tmp/rawtree-fc-instance.env}"
+REMOTE_DIR="${RAWTREE_FIRECRACKER_REMOTE_DIR:-/home/ubuntu/rawtree-firecracker-observability}"
+REMOTE_USER="${RAWTREE_FIRECRACKER_REMOTE_USER:-ubuntu}"
+SANDBOX_TABLE="${RAWTREE_SANDBOX_TABLE:-sandbox_events}"
+STATE_DIR="${RAWTREE_SANDBOX_WRAPPER_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/rawtree-firecracker-sandbox}"
+DEFAULT_WORKDIR="${SANDBOX_DEFAULT_WORKDIR:-/workspace/app}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  sandbox create [options]
+  sandbox exec [options] <sandbox-id> <command> [args...]
+  sandbox stop <sandbox-id> [sandbox-id...]
+  sandbox report [--open] <sandbox-id-or-run-id>
+  sandbox sync
+
+Examples:
+  sandbox create --runtime node
+  sandbox exec sb_... git clone https://github.com/jonschlinkert/is-odd.git
+  sandbox exec sb_... npm install
+  sandbox exec sb_... npm test
+  sandbox stop sb_...
+  sandbox report --open sb_...
+
+Environment:
+  RAWTREE_API_KEY                 RawTree API key used by the provider host.
+  RAWTREE_SANDBOX_TABLE           RawTree table. Defaults to sandbox_events.
+  RAWTREE_FIRECRACKER_INSTANCE_ENV Local env file with PUBLIC_IP and KEY_PATH.
+  RAWTREE_FIRECRACKER_REMOTE_DIR  Repo path on the Firecracker host.
+EOF
+}
+
+main() {
+  local command="${1:-}"
+  if [[ -z "$command" || "$command" == "-h" || "$command" == "--help" || "$command" == "help" ]]; then
+    usage
+    return 0
+  fi
+  shift
+
+  case "$command" in
+    create) sandbox_create "$@" ;;
+    exec) sandbox_exec "$@" ;;
+    stop) sandbox_stop "$@" ;;
+    report) sandbox_report "$@" ;;
+    sync) load_instance; sync_remote ;;
+    *) echo "unknown command: $command" >&2; usage >&2; return 2 ;;
+  esac
+}
+
+require_rawtree_key() {
+  if [[ -z "${RAWTREE_API_KEY:-}" && -z "${RAWTREE_TOKEN:-}" ]]; then
+    echo "Set RAWTREE_API_KEY before running sandbox commands." >&2
+    return 2
+  fi
+  RAWTREE_API_KEY="${RAWTREE_API_KEY:-$RAWTREE_TOKEN}"
+}
+
+load_instance() {
+  if [[ -f "$INSTANCE_ENV" ]]; then
+    # shellcheck disable=SC1090
+    source "$INSTANCE_ENV"
+  fi
+  PUBLIC_IP="${RAWTREE_FIRECRACKER_PUBLIC_IP:-${PUBLIC_IP:-}}"
+  KEY_PATH="${RAWTREE_FIRECRACKER_KEY_PATH:-${KEY_PATH:-}}"
+  if [[ -z "$PUBLIC_IP" || -z "$KEY_PATH" ]]; then
+    echo "Set PUBLIC_IP and KEY_PATH, or point RAWTREE_FIRECRACKER_INSTANCE_ENV at an env file." >&2
+    return 2
+  fi
+}
+
+quote() {
+  printf "%q" "$1"
+}
+
+remote_run() {
+  local script="$1"
+  shift
+
+  local quoted_args=()
+  local arg
+  for arg in "$@"; do
+    quoted_args+=("$(quote "$arg")")
+  done
+
+  local remote_command
+  remote_command="RAWTREE_API_KEY=$(quote "$RAWTREE_API_KEY") RAWTREE_SANDBOX_TABLE=$(quote "$SANDBOX_TABLE") REMOTE_DIR=$(quote "$REMOTE_DIR") bash -s -- ${quoted_args[*]}"
+
+  ssh \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR \
+    -i "$KEY_PATH" \
+    "$REMOTE_USER@$PUBLIC_IP" \
+    "$remote_command" <<<"$script"
+}
+
+sync_remote() {
+  rsync -az --delete \
+    --exclude .git \
+    --exclude reports \
+    --exclude .sandbox-state \
+    --exclude '*.sock' \
+    --exclude '*.log' \
+    -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i $KEY_PATH" \
+    "$REPO_ROOT/" \
+    "$REMOTE_USER@$PUBLIC_IP:$REMOTE_DIR/"
+}
+
+sandbox_create() {
+  require_rawtree_key
+  load_instance
+  sync_remote >/dev/null
+
+  local output
+  output="$(remote_run "$CREATE_SCRIPT" "$@")"
+  printf "%s\n" "$output"
+
+  local sandbox_id run_id
+  sandbox_id="$(printf "%s\n" "$output" | sed -n "s/^sandbox_id=//p" | tail -n 1)"
+  run_id="$(printf "%s\n" "$output" | sed -n "s/^run_id=//p" | tail -n 1)"
+  if [[ -n "$sandbox_id" && -n "$run_id" ]]; then
+    save_state "$sandbox_id" "$run_id" ""
+  fi
+}
+
+sandbox_exec() {
+  require_rawtree_key
+  load_instance
+
+  local args=("$@")
+  local flags=()
+  local sandbox_id=""
+  local command_start=0
+  local has_workdir=0
+  local i=0
+
+  while (( i < ${#args[@]} )); do
+    case "${args[$i]}" in
+      --workdir)
+        has_workdir=1
+        flags+=("${args[$i]}" "${args[$((i + 1))]}")
+        i=$((i + 2))
+        ;;
+      --workdir=*)
+        has_workdir=1
+        flags+=("${args[$i]}")
+        i=$((i + 1))
+        ;;
+      --env|--api-key|--base-url|--table)
+        flags+=("${args[$i]}" "${args[$((i + 1))]}")
+        i=$((i + 2))
+        ;;
+      --interactive|--sudo|--suppress-telemetry)
+        flags+=("${args[$i]}")
+        i=$((i + 1))
+        ;;
+      --)
+        i=$((i + 1))
+        sandbox_id="${args[$i]}"
+        command_start=$((i + 1))
+        break
+        ;;
+      -*)
+        flags+=("${args[$i]}")
+        i=$((i + 1))
+        ;;
+      *)
+        sandbox_id="${args[$i]}"
+        command_start=$((i + 1))
+        break
+        ;;
+    esac
+  done
+
+  if [[ -z "$sandbox_id" || $command_start -ge ${#args[@]} ]]; then
+    echo "Usage: sandbox exec [options] <sandbox-id> <command> [args...]" >&2
+    return 2
+  fi
+
+  local command_args=("${args[@]:$command_start}")
+  local is_clone_command=0
+  if [[ "${command_args[0]:-}" == "git" && "${command_args[1]:-}" == "clone" && "$has_workdir" == "0" ]]; then
+    is_clone_command=1
+    if [[ ${#command_args[@]} -eq 3 ]]; then
+      command_args+=("$DEFAULT_WORKDIR")
+      set_workdir "$sandbox_id" "$DEFAULT_WORKDIR"
+    else
+      local last_arg="${command_args[$((${#command_args[@]} - 1))]}"
+      if [[ "$last_arg" == /* ]]; then
+        set_workdir "$sandbox_id" "$last_arg"
+      fi
+    fi
+  fi
+
+  local remembered_workdir
+  remembered_workdir="$(state_value "$sandbox_id" WORKDIR || true)"
+  if [[ "$has_workdir" == "0" && "$is_clone_command" == "0" && -n "$remembered_workdir" ]]; then
+    if (( ${#flags[@]} > 0 )); then
+      flags=(--workdir "$remembered_workdir" "${flags[@]}")
+    else
+      flags=(--workdir "$remembered_workdir")
+    fi
+  fi
+
+  if (( ${#flags[@]} > 0 )); then
+    remote_run "$EXEC_SCRIPT" "${flags[@]}" "$sandbox_id" "${command_args[@]}"
+  else
+    remote_run "$EXEC_SCRIPT" "$sandbox_id" "${command_args[@]}"
+  fi
+}
+
+sandbox_stop() {
+  require_rawtree_key
+  load_instance
+  if [[ "$#" -eq 0 ]]; then
+    echo "Usage: sandbox stop <sandbox-id> [sandbox-id...]" >&2
+    return 2
+  fi
+  remote_run "$STOP_SCRIPT" "$@"
+}
+
+sandbox_report() {
+  local open_report=0
+  if [[ "${1:-}" == "--open" ]]; then
+    open_report=1
+    shift
+  fi
+  if [[ "$#" -ne 1 ]]; then
+    echo "Usage: sandbox report [--open] <sandbox-id-or-run-id>" >&2
+    return 2
+  fi
+  require_rawtree_key
+
+  local target="$1"
+  local run_id="$target"
+  if [[ "$target" == sb_* ]]; then
+    run_id="$(state_value "$target" RUN_ID)"
+  fi
+
+  local report
+  report="$(RAWTREE_API_KEY="$RAWTREE_API_KEY" RAWTREE_SANDBOX_TABLE="$SANDBOX_TABLE" node "$REPO_ROOT/scripts/generate-rich-report.mjs" "$run_id")"
+  printf "%s\n" "$report"
+  if [[ "$open_report" == "1" ]]; then
+    open "$report"
+  fi
+}
+
+save_state() {
+  local sandbox_id="$1"
+  local run_id="$2"
+  local workdir="$3"
+  mkdir -p "$STATE_DIR"
+  {
+    printf "SANDBOX_ID=%q\n" "$sandbox_id"
+    printf "RUN_ID=%q\n" "$run_id"
+    printf "WORKDIR=%q\n" "$workdir"
+  } >"$STATE_DIR/$sandbox_id.env"
+}
+
+set_workdir() {
+  local sandbox_id="$1"
+  local workdir="$2"
+  local run_id
+  run_id="$(state_value "$sandbox_id" RUN_ID || true)"
+  save_state "$sandbox_id" "$run_id" "$workdir"
+}
+
+state_value() {
+  local sandbox_id="$1"
+  local key="$2"
+  local file="$STATE_DIR/$sandbox_id.env"
+  if [[ ! -f "$file" ]]; then
+    return 1
+  fi
+  # shellcheck disable=SC1090
+  source "$file"
+  case "$key" in
+    RUN_ID) printf "%s\n" "${RUN_ID:-}" ;;
+    WORKDIR) printf "%s\n" "${WORKDIR:-}" ;;
+    *) return 1 ;;
+  esac
+}
+
+read -r -d '' CREATE_SCRIPT <<'REMOTE' || true
+set -euo pipefail
+cd "$REMOTE_DIR"
+
+setup_tap() {
+  local tap="${SANDBOX_TAP:-rtap0}"
+  local subnet="${SANDBOX_SUBNET:-172.16.0.0/24}"
+  local host_ip="${SANDBOX_HOST_IP:-172.16.0.1}"
+  local ext_if
+  ext_if="$(ip route show default | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)"
+
+  sudo ip link del "$tap" 2>/dev/null || true
+  sudo ip tuntap add dev "$tap" mode tap
+  sudo ip addr add "$host_ip/24" dev "$tap"
+  sudo ip link set "$tap" up
+  sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  sudo iptables -t nat -C POSTROUTING -s "$subnet" -o "$ext_if" -j MASQUERADE 2>/dev/null || sudo iptables -t nat -A POSTROUTING -s "$subnet" -o "$ext_if" -j MASQUERADE
+  sudo iptables -C FORWARD -i "$tap" -o "$ext_if" -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i "$tap" -o "$ext_if" -j ACCEPT
+  sudo iptables -C FORWARD -i "$ext_if" -o "$tap" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i "$ext_if" -o "$tap" -m state --state RELATED,ESTABLISHED -j ACCEPT
+}
+
+has_flag() {
+  local name="$1"
+  shift
+  local arg
+  for arg in "$@"; do
+    [[ "$arg" == "$name" || "$arg" == "$name="* ]] && return 0
+  done
+  return 1
+}
+
+flag_value() {
+  local name="$1"
+  shift
+  local previous=""
+  local arg
+  for arg in "$@"; do
+    if [[ "$previous" == "$name" ]]; then
+      printf "%s\n" "$arg"
+      return 0
+    fi
+    if [[ "$arg" == "$name="* ]]; then
+      printf "%s\n" "${arg#*=}"
+      return 0
+    fi
+    previous="$arg"
+  done
+  return 1
+}
+
+args=("$@")
+runtime="$(flag_value --runtime "${args[@]}" || true)"
+runtime="${runtime:-node}"
+setup_tap
+
+if ! has_flag --runtime "${args[@]}"; then
+  args+=(--runtime "$runtime")
+fi
+if ! has_flag --rootfs "${args[@]}"; then
+  if [[ "$runtime" == node* ]]; then
+    args+=(--rootfs /var/lib/firecracker/rootfs-node.ext4)
+  else
+    args+=(--rootfs /var/lib/firecracker/rootfs.ext4)
+  fi
+fi
+if ! has_flag --kernel "${args[@]}"; then
+  args+=(--kernel /var/lib/firecracker/vmlinux)
+fi
+if ! has_flag --firecracker "${args[@]}"; then
+  args+=(--firecracker /usr/local/bin/firecracker)
+fi
+if ! has_flag --tap "${args[@]}"; then
+  args+=(--tap "${SANDBOX_TAP:-rtap0}")
+fi
+if ! has_flag --guest-mac "${args[@]}"; then
+  args+=(--guest-mac AA:FC:00:00:00:02)
+fi
+if ! has_flag --vcpus "${args[@]}"; then
+  args+=(--vcpus 1)
+fi
+if ! has_flag --mem-mib "${args[@]}"; then
+  args+=(--mem-mib 512)
+fi
+if ! has_flag --timeout "${args[@]}"; then
+  args+=(--timeout 30m)
+fi
+if ! has_flag --metadata "${args[@]}"; then
+  args+=(--metadata demo=local-wrapper)
+fi
+
+create_output="$(sudo --preserve-env=RAWTREE_API_KEY,RAWTREE_SANDBOX_TABLE go run . create "${args[@]}")"
+printf "%s\n" "$create_output"
+sandbox_id="$(printf "%s\n" "$create_output" | sed -n 's/^sandbox_id=//p' | tail -n 1)"
+
+sudo --preserve-env=RAWTREE_API_KEY,RAWTREE_SANDBOX_TABLE go run . exec --suppress-telemetry "$sandbox_id" sh -lc '
+set -eu
+ip addr add 172.16.0.2/24 dev eth0 || true
+ip link set eth0 up
+ip route replace default via 172.16.0.1
+printf "nameserver 1.1.1.1\n" > /etc/resolv.conf
+curl -fsSL --connect-timeout 5 --max-time 20 https://api.github.com/zen >/dev/null
+'
+printf "network=ready\n"
+REMOTE
+
+read -r -d '' EXEC_SCRIPT <<'REMOTE' || true
+set -euo pipefail
+cd "$REMOTE_DIR"
+sudo --preserve-env=RAWTREE_API_KEY,RAWTREE_SANDBOX_TABLE go run . exec "$@"
+REMOTE
+
+read -r -d '' STOP_SCRIPT <<'REMOTE' || true
+set -euo pipefail
+cd "$REMOTE_DIR"
+sudo --preserve-env=RAWTREE_API_KEY,RAWTREE_SANDBOX_TABLE go run . stop "$@"
+REMOTE
+
+main "$@"

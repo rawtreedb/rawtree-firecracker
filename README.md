@@ -128,6 +128,9 @@ rawtree_firecracker_observability.go
                                   # CLI wrapper around create/exec/stop and legacy launch flow
 agent_linux.go                    # guest provider-control process for vsock exec
 
+bin/
+  sandbox                         # local demo wrapper that hides the remote Firecracker host setup
+
 internal/
   orchestrator.go                 # Linux/KVM Firecracker launch via firecracker-go-sdk
   control_linux.go                # host-side exec/stop control over Firecracker vsock
@@ -454,87 +457,31 @@ sudo -E go run . stop sb_...
 
 Under the hood, `create` starts a supervisor process that owns the Firecracker VM. `exec` and `stop` are separate CLI calls that read the sandbox state file and talk to the running VM/control plane. In production, those are the provider's internal API handlers rather than command-line calls.
 
-### Node Sandbox Demo
+### Local Node Sandbox Demo
 
-This flow mirrors a common agent workload: start a Node sandbox, clone an npm package, install dependencies, run tests, stop the sandbox, and generate the RawTree report. The rootfs must already contain `node`, `npm`, `git`, and `curl`; `--runtime node` is metadata used by the provider layer.
+This is the demo-friendly surface. The `sandbox` wrapper runs from your local machine and hides the SSH, TAP networking, Firecracker paths, and Node rootfs details. Under the hood it still talks to the Firecracker provider host.
+
+The wrapper expects `/tmp/rawtree-fc-instance.env` to contain `PUBLIC_IP` and `KEY_PATH` for the Firecracker host. You can override that with `RAWTREE_FIRECRACKER_INSTANCE_ENV`.
 
 ```bash
-cd /home/ubuntu/rawtree-firecracker-observability
+cd /Users/rafa/rawtree/rawtree-firecracker-observability
+export PATH="$PWD/bin:$PATH"
 export RAWTREE_API_KEY=rt_...
 export RAWTREE_SANDBOX_TABLE=sandbox_events
-
-export TAP=rtap0
-export SUBNET=172.16.0.0/24
-export HOST_IP=172.16.0.1
-export EXT_IF="$(ip route show default | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)"
-
-sudo ip link del "$TAP" 2>/dev/null || true
-sudo ip tuntap add dev "$TAP" mode tap
-sudo ip addr add "$HOST_IP/24" dev "$TAP"
-sudo ip link set "$TAP" up
-sudo sysctl -w net.ipv4.ip_forward=1
-sudo iptables -t nat -C POSTROUTING -s "$SUBNET" -o "$EXT_IF" -j MASQUERADE 2>/dev/null || sudo iptables -t nat -A POSTROUTING -s "$SUBNET" -o "$EXT_IF" -j MASQUERADE
-sudo iptables -C FORWARD -i "$TAP" -o "$EXT_IF" -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i "$TAP" -o "$EXT_IF" -j ACCEPT
-sudo iptables -C FORWARD -i "$EXT_IF" -o "$TAP" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i "$EXT_IF" -o "$TAP" -m state --state RELATED,ESTABLISHED -j ACCEPT
-
-CREATE_OUTPUT="$(sudo --preserve-env=RAWTREE_API_KEY,RAWTREE_SANDBOX_TABLE go run . create \
-  --runtime node \
-  --rootfs /var/lib/firecracker/rootfs-node.ext4 \
-  --kernel /var/lib/firecracker/vmlinux \
-  --firecracker /usr/local/bin/firecracker \
-  --vcpus 1 \
-  --mem-mib 512 \
-  --timeout 30m \
-  --tap "$TAP" \
-  --guest-mac AA:FC:00:00:00:02 \
-  --metadata demo=node-npm-tests \
-  --metadata repo=is-odd)"
-
+CREATE_OUTPUT="$(sandbox create --runtime node)"
 echo "$CREATE_OUTPUT"
+
 SANDBOX_ID="$(printf "%s\n" "$CREATE_OUTPUT" | sed -n "s/^sandbox_id=//p")"
-RUN_ID="$(printf "%s\n" "$CREATE_OUTPUT" | sed -n "s/^run_id=//p")"
-echo "SANDBOX_ID=$SANDBOX_ID"
-echo "RUN_ID=$RUN_ID"
 
-sudo --preserve-env=RAWTREE_API_KEY,RAWTREE_SANDBOX_TABLE go run . exec "$SANDBOX_ID" sh -lc '
-set -eu
-ip addr add 172.16.0.2/24 dev eth0 || true
-ip link set eth0 up
-ip route replace default via 172.16.0.1
-printf "nameserver 1.1.1.1\n" > /etc/resolv.conf
-curl -fsSL --connect-timeout 5 --max-time 20 https://api.github.com/zen
-'
-
-sudo --preserve-env=RAWTREE_API_KEY,RAWTREE_SANDBOX_TABLE go run . exec "$SANDBOX_ID" sh -lc '
-node --version
-npm --version
-git --version
-'
-
-sudo --preserve-env=RAWTREE_API_KEY,RAWTREE_SANDBOX_TABLE go run . exec "$SANDBOX_ID" sh -lc '
-set -eu
-rm -rf /workspace
-mkdir -p /workspace
-git clone --depth 1 https://github.com/jonschlinkert/is-odd.git /workspace/is-odd
-cd /workspace/is-odd
-git log --oneline -1
-'
-
-sudo --preserve-env=RAWTREE_API_KEY,RAWTREE_SANDBOX_TABLE go run . exec "$SANDBOX_ID" sh -lc '
-set -eu
-cd /workspace/is-odd
-npm install
-'
-
-sudo --preserve-env=RAWTREE_API_KEY,RAWTREE_SANDBOX_TABLE go run . exec "$SANDBOX_ID" sh -lc '
-set -eu
-cd /workspace/is-odd
-npm test
-'
-
-sudo --preserve-env=RAWTREE_API_KEY,RAWTREE_SANDBOX_TABLE go run . stop "$SANDBOX_ID"
-RAWTREE_API_KEY="$RAWTREE_API_KEY" node scripts/generate-rich-report.mjs "$RUN_ID"
+sandbox exec "$SANDBOX_ID" node --version
+sandbox exec "$SANDBOX_ID" git clone https://github.com/jonschlinkert/is-odd.git
+sandbox exec "$SANDBOX_ID" npm install
+sandbox exec "$SANDBOX_ID" npm test
+sandbox stop "$SANDBOX_ID"
+sandbox report --open "$SANDBOX_ID"
 ```
+
+When `sandbox exec "$SANDBOX_ID" git clone <repo>` is run without a destination, the wrapper clones into `/workspace/app` and remembers that as the sandbox workdir. Later `npm install` and `npm test` commands automatically run there. If you want full control, pass an explicit destination and use `--workdir`.
 
 The legacy one-shot demo is still available by passing the root flags directly:
 
