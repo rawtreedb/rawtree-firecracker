@@ -2,6 +2,8 @@ package observability
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -22,21 +24,49 @@ func NewCollector(request SandboxLaunchRequest) *Collector {
 	return &Collector{
 		client: &http.Client{
 			Timeout: 15 * time.Second,
+			Transport: &http.Transport{
+				ForceAttemptHTTP2:     false,
+				IdleConnTimeout:       30 * time.Second,
+				ResponseHeaderTimeout: 10 * time.Second,
+				TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{},
+				TLSHandshakeTimeout:   5 * time.Second,
+			},
 		},
 		request: request,
 	}
 }
 
 func (c *Collector) Record(event Event) error {
-	enriched := c.enrich(event)
-	payload, err := json.Marshal(enriched)
+	return c.RecordMany([]Event{event})
+}
+
+func (c *Collector) RecordMany(events []Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	enrichedEvents := make([]Event, 0, len(events))
+	for _, event := range events {
+		enrichedEvents = append(enrichedEvents, c.enrich(event))
+	}
+
+	var payload []byte
+	var err error
+	if len(enrichedEvents) == 1 {
+		payload, err = json.Marshal(enrichedEvents[0])
+	} else {
+		payload, err = json.Marshal(enrichedEvents)
+	}
 	if err != nil {
 		return fmt.Errorf("marshal RawTree event: %w", err)
 	}
 
 	url := strings.TrimRight(c.request.RawTree.BaseURL, "/") +
 		"/v1/tables/" + c.request.RawTree.Table
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		return fmt.Errorf("create RawTree request: %w", err)
 	}

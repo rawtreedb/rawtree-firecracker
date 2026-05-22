@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
@@ -201,7 +202,7 @@ func WaitForSandboxStopped(ctx context.Context, sandboxID string, interval time.
 
 	for {
 		state, err := ReadState(sandboxID)
-		if err == nil && state.Status == "stopped" {
+		if err == nil && state.Status == "stopped" && !processIsRunning(state.SupervisorPID) {
 			return state, nil
 		}
 
@@ -214,6 +215,20 @@ func WaitForSandboxStopped(ctx context.Context, sandboxID string, interval time.
 		case <-ticker.C:
 		}
 	}
+}
+
+func processIsRunning(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	if stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); err == nil {
+		fields := strings.Fields(string(stat))
+		if len(fields) > 2 && fields[2] == "Z" {
+			return false
+		}
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || err == syscall.EPERM
 }
 
 func requestFromState(state SandboxState, rawtree RawTreeConfig) SandboxLaunchRequest {

@@ -454,6 +454,77 @@ sudo -E go run . stop sb_...
 
 Under the hood, `create` starts a supervisor process that owns the Firecracker VM. `exec` and `stop` are separate CLI calls that read the sandbox state file and talk to the running VM/control plane. In production, those are the provider's internal API handlers rather than command-line calls.
 
+### Node Sandbox Demo
+
+This flow mirrors a common agent workload: start a Node sandbox, clone an npm package, install dependencies, run tests, stop the sandbox, and generate the RawTree report. The rootfs must already contain `node`, `npm`, `git`, and `curl`; `--runtime node` is metadata used by the provider layer.
+
+```bash
+cd /home/ubuntu/rawtree-firecracker-observability
+export RAWTREE_API_KEY=rt_...
+export RAWTREE_SANDBOX_TABLE=sandbox_events
+
+export TAP=rtap0
+export SUBNET=172.16.0.0/24
+export HOST_IP=172.16.0.1
+export EXT_IF="$(ip route show default | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)"
+
+sudo ip link del "$TAP" 2>/dev/null || true
+sudo ip tuntap add dev "$TAP" mode tap
+sudo ip addr add "$HOST_IP/24" dev "$TAP"
+sudo ip link set "$TAP" up
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo iptables -t nat -C POSTROUTING -s "$SUBNET" -o "$EXT_IF" -j MASQUERADE 2>/dev/null || sudo iptables -t nat -A POSTROUTING -s "$SUBNET" -o "$EXT_IF" -j MASQUERADE
+sudo iptables -C FORWARD -i "$TAP" -o "$EXT_IF" -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i "$TAP" -o "$EXT_IF" -j ACCEPT
+sudo iptables -C FORWARD -i "$EXT_IF" -o "$TAP" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || sudo iptables -A FORWARD -i "$EXT_IF" -o "$TAP" -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+CREATE_OUTPUT="$(sudo --preserve-env=RAWTREE_API_KEY,RAWTREE_SANDBOX_TABLE go run . create \
+  --runtime node \
+  --rootfs /var/lib/firecracker/rootfs-node.ext4 \
+  --kernel /var/lib/firecracker/vmlinux \
+  --firecracker /usr/local/bin/firecracker \
+  --vcpus 1 \
+  --mem-mib 512 \
+  --timeout 30m \
+  --tap "$TAP" \
+  --guest-mac AA:FC:00:00:00:02 \
+  --metadata demo=node-npm-tests \
+  --metadata repo=is-odd)"
+
+echo "$CREATE_OUTPUT"
+SANDBOX_ID="$(printf "%s\n" "$CREATE_OUTPUT" | sed -n "s/^sandbox_id=//p")"
+RUN_ID="$(printf "%s\n" "$CREATE_OUTPUT" | sed -n "s/^run_id=//p")"
+echo "SANDBOX_ID=$SANDBOX_ID"
+echo "RUN_ID=$RUN_ID"
+
+sudo --preserve-env=RAWTREE_API_KEY,RAWTREE_SANDBOX_TABLE go run . exec "$SANDBOX_ID" sh -lc '
+set -eu
+ip addr add 172.16.0.2/24 dev eth0 || true
+ip link set eth0 up
+ip route replace default via 172.16.0.1
+printf "nameserver 1.1.1.1\n" > /etc/resolv.conf
+curl -fsSL --connect-timeout 5 --max-time 20 https://api.github.com/zen
+'
+
+sudo --preserve-env=RAWTREE_API_KEY,RAWTREE_SANDBOX_TABLE go run . exec "$SANDBOX_ID" sh -lc '
+node --version
+npm --version
+git --version
+'
+
+sudo --preserve-env=RAWTREE_API_KEY,RAWTREE_SANDBOX_TABLE go run . exec "$SANDBOX_ID" sh -lc '
+set -eu
+rm -rf /workspace
+mkdir -p /workspace
+git clone --depth 1 https://github.com/jonschlinkert/is-odd.git /workspace/is-odd
+cd /workspace/is-odd
+npm install
+npm test
+'
+
+sudo --preserve-env=RAWTREE_API_KEY,RAWTREE_SANDBOX_TABLE go run . stop "$SANDBOX_ID"
+RAWTREE_API_KEY="$RAWTREE_API_KEY" node scripts/generate-rich-report.mjs "$RUN_ID"
+```
+
 The legacy one-shot demo is still available by passing the root flags directly:
 
 ```bash

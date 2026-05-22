@@ -27,6 +27,7 @@ func emitFirecrackerLogs(logPath string, collector *Collector) error {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
+	events := make([]Event, 0, 100)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -46,12 +47,20 @@ func emitFirecrackerLogs(logPath string, collector *Collector) error {
 		if sampledAt := sampledAtFromLogLine(line); sampledAt != "" {
 			event["sampled_at"] = sampledAt
 		}
-		if err := collector.Record(event); err != nil {
+		events = append(events, event)
+		if len(events) < 100 {
+			continue
+		}
+		if err := collector.RecordMany(events); err != nil {
 			return err
 		}
+		events = events[:0]
 	}
 
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return collector.RecordMany(events)
 }
 
 func emitFirecrackerMetrics(metricsPath string, collector *Collector) error {
@@ -65,6 +74,7 @@ func emitFirecrackerMetrics(metricsPath string, collector *Collector) error {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
+	events := make([]Event, 0, 100)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -87,12 +97,20 @@ func emitFirecrackerMetrics(metricsPath string, collector *Collector) error {
 		if sampledAt := sampledAtFromMetrics(metrics); sampledAt != "" {
 			event["sampled_at"] = sampledAt
 		}
-		if err := collector.Record(event); err != nil {
+		events = append(events, event)
+		if len(events) < 100 {
+			continue
+		}
+		if err := collector.RecordMany(events); err != nil {
 			return err
 		}
+		events = events[:0]
 	}
 
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return collector.RecordMany(events)
 }
 
 func sampledAtFromMetrics(metrics map[string]any) string {
