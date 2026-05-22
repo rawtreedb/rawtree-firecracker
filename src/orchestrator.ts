@@ -17,12 +17,14 @@ type CliOptions = {
   apiKey: string;
   baseUrl: string;
   bootArgs?: string;
+  cgroupPath?: string;
   dryRun: boolean;
   firecracker: string;
   guestMac?: string;
   hypervisorSampleIntervalMs: number;
   kernel: string;
   memMiB: number;
+  metricsFlushIntervalMs: number;
   metadata: Record<string, string>;
   provider: string;
   rootfs: string;
@@ -42,6 +44,7 @@ const DEFAULT_PROVIDER = "firecracker-sandbox-provider";
 const DEFAULT_TABLE = "sandbox_events";
 const DEFAULT_RUN_TIMEOUT_MS = 30_000;
 const DEFAULT_HYPERVISOR_SAMPLE_INTERVAL_MS = 1_000;
+const DEFAULT_METRICS_FLUSH_INTERVAL_MS = 0;
 const FIRECRACKER_EXIT_TIMEOUT_MS = 5_000;
 
 async function main(): Promise<void> {
@@ -67,7 +70,9 @@ async function launchObservedSandbox(request: SandboxLaunchRequest): Promise<voi
   const paths = await runtimePaths(request.sandboxId);
   let firecracker: ChildProcess | undefined;
   let collector: HostCollector | undefined;
+  let cgroupDir: string | undefined;
   let hypervisorSampler: HypervisorSampler | undefined;
+  let stopMetricsFlusher: (() => Promise<void>) | undefined;
 
   try {
     await fs.copyFile(request.rootfs, paths.rootfsCopyPath);
@@ -88,6 +93,9 @@ async function launchObservedSandbox(request: SandboxLaunchRequest): Promise<voi
       throw new Error("Firecracker process started without a host PID.");
     }
     const firecrackerExit = onceExit(firecracker);
+    if (request.cgroupPath) {
+      cgroupDir = await moveProcessToCgroup(firecracker.pid, request.cgroupPath);
+    }
     hypervisorSampler = startHypervisorSampler({
       collector,
       intervalMs: request.hypervisorSampleIntervalMs,
@@ -108,6 +116,7 @@ async function launchObservedSandbox(request: SandboxLaunchRequest): Promise<voi
     });
     await configureFirecrackerMicroVM(fc, request.firecracker, paths.rootfsCopyPath);
     await fc.put("/actions", { action_type: "InstanceStart" });
+    stopMetricsFlusher = startMetricsFlusher(fc, request.metricsFlushIntervalMs);
 
     await collector.record({
       event_type: "sandbox.firecracker.provider.vm.started",
@@ -118,6 +127,7 @@ async function launchObservedSandbox(request: SandboxLaunchRequest): Promise<voi
       firecracker_log_path: paths.firecrackerLogPath,
       firecracker_metrics_path: paths.firecrackerMetricsPath,
       firecracker_pid: firecracker.pid,
+      sandbox_cgroup_path: request.cgroupPath ?? null,
       workspace_dir: paths.workspaceDir,
     });
 
@@ -132,6 +142,9 @@ async function launchObservedSandbox(request: SandboxLaunchRequest): Promise<voi
       firecrackerExit.then((exitCode) => ({ exitCode, reason: "firecracker_exit" as const })),
       sleep(request.runTimeoutMs).then(() => ({ exitCode: 0, reason: "run_timeout_reached" as const })),
     ]);
+
+    await stopMetricsFlusher?.();
+    stopMetricsFlusher = undefined;
 
     if (stopResult.reason !== "firecracker_exit") {
       await hypervisorSampler.sample();
@@ -165,6 +178,7 @@ async function launchObservedSandbox(request: SandboxLaunchRequest): Promise<voi
 
     throw error;
   } finally {
+    await stopMetricsFlusher?.();
     await hypervisorSampler?.stop();
 
     if (firecracker) {
@@ -172,6 +186,9 @@ async function launchObservedSandbox(request: SandboxLaunchRequest): Promise<voi
     }
 
     await collector?.close();
+    if (cgroupDir) {
+      await fs.rmdir(cgroupDir).catch(() => undefined);
+    }
     await fs.rm(paths.workspaceDir, { force: true, recursive: true }).catch(() => undefined);
   }
 }
@@ -196,9 +213,10 @@ function sandboxLaunchRequestFromOptions(options: CliOptions): SandboxLaunchRequ
     firecracker.tap = options.tap;
   }
 
-  return {
+  const request: SandboxLaunchRequest = {
     firecracker,
     metadata: options.metadata,
+    metricsFlushIntervalMs: options.metricsFlushIntervalMs,
     provider: options.provider,
     rawtree: {
       apiKey: options.apiKey,
@@ -211,6 +229,12 @@ function sandboxLaunchRequestFromOptions(options: CliOptions): SandboxLaunchRequ
     runTimeoutMs: options.runTimeoutMs,
     sandboxId: options.sandboxId,
   };
+
+  if (options.cgroupPath) {
+    request.cgroupPath = options.cgroupPath;
+  }
+
+  return request;
 }
 
 async function runtimePaths(sandboxId: string): Promise<RuntimePaths> {
@@ -245,10 +269,12 @@ function dryRunPlan(request: SandboxLaunchRequest): Record<string, unknown> {
       interval_ms: request.hypervisorSampleIntervalMs,
       source: "/proc/<firecracker-pid> and cgroup v2 files on the host",
     },
+    metrics_flush_interval_ms: request.metricsFlushIntervalMs,
     metadata: request.metadata,
     provider: request.provider,
     rawtree_api_key_location: "host collector only",
     rootfs_source: request.rootfs,
+    sandbox_cgroup_path: request.cgroupPath,
     run_id: request.runId,
     run_timeout_ms: request.runTimeoutMs,
     sandbox_id: request.sandboxId,
@@ -370,6 +396,11 @@ function parseArgs(args: string[]): ParsedArgs {
     ),
     kernel,
     memMiB: numberOption(values, "mem-mib", 512),
+    metricsFlushIntervalMs: nonNegativeNumberOption(
+      values,
+      "metrics-flush-interval-ms",
+      DEFAULT_METRICS_FLUSH_INTERVAL_MS,
+    ),
     metadata,
     provider: values.get("provider") ?? DEFAULT_PROVIDER,
     rootfs,
@@ -378,6 +409,11 @@ function parseArgs(args: string[]): ParsedArgs {
     table: values.get("table") ?? process.env.RAWTREE_SANDBOX_TABLE ?? DEFAULT_TABLE,
     vcpuCount: numberOption(values, "vcpu-count", 1),
   };
+
+  const cgroupPath = values.get("cgroup-path");
+  if (cgroupPath) {
+    options.cgroupPath = cgroupPath;
+  }
 
   const bootArgs = values.get("boot-args");
   if (bootArgs) {
@@ -414,6 +450,68 @@ function numberOption(values: Map<string, string>, key: string, fallback: number
   return parsed;
 }
 
+function nonNegativeNumberOption(values: Map<string, string>, key: string, fallback: number): number {
+  const value = values.get(key);
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`--${key} must be a non-negative integer.`);
+  }
+
+  return parsed;
+}
+
+function startMetricsFlusher(
+  fc: ReturnType<typeof firecrackerClient>,
+  intervalMs: number,
+): (() => Promise<void>) | undefined {
+  if (intervalMs <= 0) {
+    return undefined;
+  }
+
+  let flushing: Promise<void> | undefined;
+
+  const interval = setInterval(() => {
+    if (flushing) {
+      return;
+    }
+
+    flushing = fc.put("/actions", { action_type: "FlushMetrics" }).catch((error) => {
+      console.error("Firecracker metrics flush failed:", error);
+    }).finally(() => {
+      flushing = undefined;
+    });
+  }, intervalMs);
+  interval.unref();
+
+  return async () => {
+    clearInterval(interval);
+    await flushing;
+  };
+}
+
+async function moveProcessToCgroup(pid: number, cgroupPath: string): Promise<string> {
+  const relativePath = normalizeCgroupPath(cgroupPath);
+  const cgroupDir = path.join("/sys/fs/cgroup", relativePath);
+
+  await fs.mkdir(cgroupDir, { recursive: true });
+  await fs.writeFile(path.join(cgroupDir, "cgroup.procs"), `${pid}\n`);
+
+  return cgroupDir;
+}
+
+function normalizeCgroupPath(cgroupPath: string): string {
+  const normalized = path.posix.normalize(`/${cgroupPath}`).replace(/^\/+/, "");
+  if (!normalized || normalized === "." || normalized.startsWith("..") || normalized.includes("/../")) {
+    throw new Error("--cgroup-path must be a relative cgroup v2 path.");
+  }
+
+  return normalized;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -448,11 +546,14 @@ function usage(): string {
     "  --api-key <key>          RawTree API key; host collector only",
     "  --base-url <url>         RawTree API base URL",
     "  --boot-args <args>       Kernel boot args, default: " + DEFAULT_BOOT_ARGS,
+    "  --cgroup-path <path>     Optional cgroup v2 path for the Firecracker process",
     "  --dry-run                Print the provider integration plan without starting Firecracker",
     "  --guest-mac <mac>        Guest MAC for optional TAP device",
     "  --hypervisor-sample-interval-ms <n>",
     "                           Host process/cgroup sample interval, default 1000",
     "  --mem-mib <n>            Memory in MiB, default 512",
+    "  --metrics-flush-interval-ms <n>",
+    "                           Periodic Firecracker FlushMetrics interval; 0 disables it",
     "  --metadata <key=value>   Provider metadata; can be passed multiple times",
     "  --provider <name>        Provider name",
     "  --run-timeout-ms <n>     Demo stop timeout before FlushMetrics and SIGTERM, default 30000",

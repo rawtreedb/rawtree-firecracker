@@ -39,7 +39,7 @@ This reference emits provider lifecycle events, Firecracker-native events, and h
 
 | Event | Meaning |
 | --- | --- |
-| `sandbox.hypervisor.sample` | One raw host-side sample for the Firecracker process and cgroup. |
+| `sandbox.hypervisor.sample` | One nested host-side sample for the Firecracker process and cgroup. |
 | `sandbox.hypervisor.sample.failed` | The host-side sampler could not read the process or cgroup. |
 
 ## Example Query

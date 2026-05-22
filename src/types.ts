@@ -15,8 +15,10 @@ export type FirecrackerConfig = {
 };
 
 export type SandboxLaunchRequest = {
+  cgroupPath?: string;
   firecracker: FirecrackerConfig;
   metadata: Record<string, string>;
+  metricsFlushIntervalMs: number;
   provider: string;
   rawtree: RawTreeConfig;
   rootfs: string;

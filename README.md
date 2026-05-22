@@ -314,6 +314,52 @@ sudo -E npm run start -- \
 
 The demo has a default `--run-timeout-ms 30000`. When that timeout is reached, it calls `FlushMetrics`, terminates Firecracker, reads the Firecracker log and metrics files, and sends the resulting events to RawTree. In a real provider platform, the stop signal would come from the provider's normal sandbox lifecycle.
 
+## Rich Example
+
+The rich example prepares a copy of the rootfs with a small boot-time workload.
+That workload writes and reads temporary files and burns CPU for a few short
+bursts. The provider process also moves Firecracker into a dedicated cgroup and
+flushes Firecracker metrics every two seconds, so RawTree receives a useful time
+series instead of only a final metric snapshot.
+
+Run it on a Linux host with KVM:
+
+```bash
+export RAWTREE_API_KEY=rt_...
+npm run rich-example
+```
+
+What this produces:
+
+- provider lifecycle events
+- host hypervisor samples every second
+- periodic Firecracker VMM metrics every two seconds
+- Firecracker VMM log lines
+- metadata marking the run as `scenario=rich-example`
+
+The example prints the `run_id`. Use that id with the SQL files in `sql/`:
+
+```bash
+RUN_ID=rt_firecracker_sandbox_run_...
+SQL=$(sed "s/<RUN_ID>/$RUN_ID/g" sql/05_run_summary.sql)
+rtree query --sql "$SQL"
+```
+
+Generate a standalone HTML report from those SQL-backed views:
+
+```bash
+RAWTREE_API_KEY=rt_... npm run rich-report -- "$RUN_ID"
+```
+
+Useful files:
+
+- `sql/00_event_counts.sql`: event volume by event type
+- `sql/01_event_timeline.sql`: event timeline by second
+- `sql/02_hypervisor_cpu_memory.sql`: host process and cgroup CPU/memory
+- `sql/03_firecracker_io_metrics.sql`: rootfs IO and vCPU exit counters
+- `sql/04_firecracker_logs.sql`: Firecracker VMM log lines
+- `sql/05_run_summary.sql`: one-row run summary
+
 ## Example Events
 
 Provider lifecycle:

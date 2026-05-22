@@ -7,6 +7,8 @@
   "scripts": {
     "check": "tsc --noEmit",
     "dry-run": "tsx src/orchestrator.ts --dry-run --kernel /var/lib/firecracker/vmlinux --rootfs /var/lib/firecracker/rootfs.ext4 --metadata provider=example --metadata environment=poc",
+    "rich-report": "node scripts/generate-rich-report.mjs",
+    "rich-example": "bash examples/rich-firecracker-workload.sh",
     "start": "tsx src/orchestrator.ts"
   },
   "engines": {
