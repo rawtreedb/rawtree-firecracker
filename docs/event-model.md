@@ -2,7 +2,7 @@
 
 All events are JSON objects inserted into a RawTree table. The host collector enriches every event with common provider fields before writing it.
 
-This reference emits provider lifecycle events, Firecracker-native events, and host-side hypervisor samples. It does not emit guest agent events.
+This reference emits provider lifecycle events, sandbox exec events, Firecracker-native events, and host-side hypervisor samples. The guest control process never writes directly to RawTree; exec events are emitted by the host control plane after it talks to the guest over vsock.
 
 ## Common Fields
 
@@ -35,6 +35,16 @@ This reference emits provider lifecycle events, Firecracker-native events, and h
 | `sandbox.firecracker.vmm.log` | One Firecracker logger line from the host log file. |
 | `sandbox.firecracker.vmm.metrics` | One Firecracker metrics JSON object from the host metrics file. |
 
+## Sandbox Exec Events
+
+| Event | Meaning |
+| --- | --- |
+| `sandbox.exec.started` | The provider accepted an exec request and is about to send it over vsock. |
+| `sandbox.exec.process.started` | The guest control process started the command and returned a guest PID. |
+| `sandbox.exec.output` | One stdout or stderr chunk from the command. |
+| `sandbox.exec.completed` | The command exited and returned an exit code. |
+| `sandbox.exec.failed` | The provider could not send, run, or finish the exec request cleanly. |
+
 ## Hypervisor Events
 
 | Event | Meaning |
@@ -54,10 +64,34 @@ SELECT
   status,
   `firecracker.log.line`,
   `firecracker.metrics.block_rootfs.read_bytes`,
-  `hypervisor.process.status.vm_rss_bytes`
+  `hypervisor.process.status.vm_rss_bytes`,
+  command,
+  stream,
+  chunk_preview
 FROM sandbox_events
 ORDER BY event_time DESC
 LIMIT 100;
+```
+
+Extract exec activity for one run:
+
+```sql
+SELECT
+  event_time,
+  event_type,
+  status,
+  exec_id,
+  command,
+  stream,
+  chunk_bytes,
+  chunk_preview,
+  exit_code,
+  duration_ms,
+  guest_pid
+FROM sandbox_events
+WHERE toString(run_id) = '<RUN_ID>'
+  AND startsWith(toString(event_type), 'sandbox.exec.')
+ORDER BY event_time;
 ```
 
 Extract useful metrics from the nested Firecracker object at query time:

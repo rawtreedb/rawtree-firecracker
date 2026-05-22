@@ -11,6 +11,10 @@ func LaunchObservedSandbox(ctx context.Context, request SandboxLaunchRequest) er
 	return fmt.Errorf("this reference starts real Firecracker, so it must run on a Linux host with KVM")
 }
 
+func RunSandboxSupervisor(ctx context.Context, request SandboxLaunchRequest, statePath string) error {
+	return fmt.Errorf("this reference starts real Firecracker, so it must run on a Linux host with KVM")
+}
+
 func AssertCanRunFirecracker() error {
 	return fmt.Errorf("this reference starts real Firecracker, so it must run on a Linux host with KVM")
 }

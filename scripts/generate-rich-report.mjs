@@ -22,6 +22,7 @@ const queries = {
   io: "sql/03_firecracker_io_metrics.sql",
   logs: "sql/04_firecracker_logs.sql",
   summary: "sql/05_run_summary.sql",
+  execActivity: "sql/06_exec_activity.sql",
 };
 
 const results = {};
@@ -267,7 +268,9 @@ function renderHtml(data) {
         border-radius: 2px;
       }
 
-      .logs-list {
+      .logs-list,
+      .activity-list,
+      .command-list {
         display: grid;
         gap: 8px;
         margin-top: 12px;
@@ -289,6 +292,77 @@ function renderHtml(data) {
 
       .log-line {
         overflow-wrap: anywhere;
+      }
+
+      .activity-row {
+        display: grid;
+        grid-template-columns: 210px minmax(0, 1fr);
+        gap: 10px;
+        border: 1px solid var(--grid);
+        border-radius: 6px;
+        padding: 9px;
+        font-size: 12px;
+      }
+
+      .activity-meta {
+        color: var(--muted);
+        line-height: 1.6;
+      }
+
+      .activity-body {
+        overflow-wrap: anywhere;
+        line-height: 1.6;
+      }
+
+      .command-row {
+        border: 1px solid var(--grid);
+        border-radius: 6px;
+        padding: 12px;
+        font-size: 12px;
+      }
+
+      .command-head {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 10px;
+        color: var(--muted);
+      }
+
+      .command-status {
+        border-radius: 4px;
+        padding: 2px 6px;
+        background: #ecfdf5;
+        color: #047857;
+        font-weight: 700;
+      }
+
+      .command-status.error {
+        background: #fef2f2;
+        color: #b91c1c;
+      }
+
+      .command-line,
+      .command-output {
+        overflow: auto;
+        margin: 0;
+        border-radius: 6px;
+        padding: 10px;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      .command-line {
+        background: #f8fafc;
+        border: 1px solid var(--grid);
+        color: var(--text);
+      }
+
+      .command-output {
+        margin-top: 8px;
+        background: #111827;
+        color: #eef2ff;
       }
 
       details {
@@ -410,6 +484,18 @@ function renderHtml(data) {
         <h2>Firecracker Logs</h2>
         <p>First 16 VMM log lines from the run.</p>
         <div id="logs" class="logs-list"></div>
+      </section>
+
+      <section class="logs">
+        <h2>Commands Run</h2>
+        <p>Provider exec calls sent into the sandbox over the Firecracker vsock control channel.</p>
+        <div id="commands-run" class="command-list"></div>
+      </section>
+
+      <section class="logs">
+        <h2>Sandbox Exec Activity</h2>
+        <p>Commands and output chunks sent through the provider vsock control channel.</p>
+        <div id="exec-activity" class="activity-list"></div>
       </section>
 
       <details>
@@ -655,6 +741,95 @@ function renderHtml(data) {
         ).join("");
       }
 
+      function renderCommandsRun() {
+        const commands = commandsFromExecActivity(report.results.execActivity.data);
+        if (commands.length === 0) {
+          document.getElementById("commands-run").innerHTML = '<div class="command-row">No commands recorded for this run.</div>';
+          return;
+        }
+
+        document.getElementById("commands-run").innerHTML = commands.map((command, index) => {
+          const statusClass = command.status === "success" ? "" : " error";
+          const output = command.output.length > 0
+            ? '<pre class="command-output">' + html(command.output.join("")) + '</pre>'
+            : "";
+          const meta = [
+            "#" + (index + 1),
+            command.startedAt,
+            command.workdir ? "workdir=" + command.workdir : "",
+            "exit=" + command.exitCode,
+            command.durationMs ? "duration=" + fmt(command.durationMs, 0) + "ms" : "",
+            command.guestPid ? "pid=" + command.guestPid : "",
+          ].filter(Boolean).map(html).join(" · ");
+
+          return [
+            '<div class="command-row">',
+            '<div class="command-head"><span class="command-status' + statusClass + '">' + html(command.status) + '</span><span>' + meta + '</span></div>',
+            '<pre class="command-line">' + html(command.command) + '</pre>',
+            output,
+            '</div>',
+          ].join("");
+        }).join("");
+      }
+
+      function commandsFromExecActivity(rows) {
+        const byExecId = new Map();
+        for (const row of rows) {
+          if (!row.exec_id) continue;
+          if (!byExecId.has(row.exec_id)) {
+            byExecId.set(row.exec_id, {
+              command: "",
+              durationMs: 0,
+              exitCode: 0,
+              guestPid: 0,
+              output: [],
+              startedAt: row.ts,
+              status: row.status || "unknown",
+              workdir: "",
+            });
+          }
+
+          const command = byExecId.get(row.exec_id);
+          if (row.event_type === "sandbox.exec.started") {
+            command.command = row.command || command.command;
+            command.startedAt = row.ts || command.startedAt;
+            command.workdir = row.workdir || "";
+          }
+          if (row.event_type === "sandbox.exec.process.started") {
+            command.guestPid = row.guest_pid || command.guestPid;
+          }
+          if (row.event_type === "sandbox.exec.output" && row.chunk_preview) {
+            command.output.push(row.chunk_preview);
+          }
+          if (row.event_type === "sandbox.exec.completed") {
+            command.durationMs = row.duration_ms || 0;
+            command.exitCode = row.exit_code || 0;
+            command.status = row.status || command.status;
+          }
+        }
+
+        return [...byExecId.values()].filter((command) => command.command);
+      }
+
+      function renderExecActivity() {
+        const rows = report.results.execActivity.data.slice(0, 40);
+        if (rows.length === 0) {
+          document.getElementById("exec-activity").innerHTML = '<div class="activity-row"><div class="activity-meta">No exec events</div><div class="activity-body">This run did not use the lifecycle exec API.</div></div>';
+          return;
+        }
+
+        document.getElementById("exec-activity").innerHTML = rows.map((row) => {
+          const detail = row.chunk_preview || row.command || ("exit_code=" + row.exit_code + " duration_ms=" + row.duration_ms);
+          const meta = [
+            row.ts,
+            row.event_type,
+            row.stream ? "stream=" + row.stream : "",
+            row.guest_pid ? "pid=" + row.guest_pid : "",
+          ].filter(Boolean).map(html).join("<br>");
+          return '<div class="activity-row"><div class="activity-meta">' + meta + '</div><div class="activity-body">' + html(detail) + '</div></div>';
+        }).join("");
+      }
+
       renderSummary();
       renderHorizontalBars("event-counts", report.results.eventCounts.data);
       renderStackedTimeline("event-timeline", "timeline-legend", report.results.timeline.data);
@@ -675,6 +850,8 @@ function renderHtml(data) {
         { key: "uart_writes", color: colors.slate },
       ], "");
       renderLogs();
+      renderCommandsRun();
+      renderExecActivity();
       document.getElementById("raw-json").textContent = JSON.stringify(report.results, null, 2);
     </script>
   </body>

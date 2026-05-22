@@ -12,8 +12,9 @@ create sandbox request
   -> select rootfs/image
   -> start RawTree host collector
   -> create Firecracker log and metrics files
+  -> inject or enable provider control agent in the guest image
   -> build firecracker-go-sdk Config
-  -> SDK configures Firecracker logger, metrics, boot source, drives, machine, and optional network
+  -> SDK configures Firecracker logger, metrics, boot source, drives, vsock, machine, and optional network
   -> SDK starts Firecracker
   -> sample Firecracker host process and cgroup metrics
 ```
@@ -28,18 +29,22 @@ The host side owns:
 - Firecracker process lifecycle
 - Firecracker logger path
 - Firecracker metrics path
+- Firecracker vsock device path
 - Firecracker host PID and cgroup metrics
+- exec requests and stdout/stderr frames
 - event batching and writes to RawTree
 
 The RawTree collector should run next to the Firecracker process, not inside the guest.
 
 ## Guest Responsibilities
 
-None for this reference.
+For the `create` / `exec` / `stop` lifecycle reference, the guest runs a small provider-control process that listens on a Firecracker vsock port. It receives JSON exec requests from the host and streams JSON frames back for process start, stdout, stderr, exit, and errors.
 
-This version does not install a RawTree agent, does not change the guest init process, and does not require RawTree credentials inside the VM.
+This process is not a RawTree agent. It does not receive RawTree credentials and it does not write to RawTree. Its job is equivalent to the internal process a sandbox provider needs when it supports "run this command in my sandbox after boot".
 
-If the provider already has guest-level events from its own sandbox control plane, such as exec, file upload/download, stdout/stderr, or workload logs, those can be emitted to RawTree as provider-native events. They are outside this Firecracker-only reference.
+The reference injects the process into a copied rootfs and enables it with a systemd service. A production provider could instead bake it into an image, add it to a snapshot, start it from its own init system, or replace it with an existing guest-control process.
+
+If the provider already has guest-level events from its own sandbox control plane, such as file upload/download, process trees, network summaries, or workload logs, those can be emitted to RawTree as provider-native events too.
 
 ## Firecracker Logger
 
@@ -67,6 +72,27 @@ Client.CreateSyncAction({ action_type: "FlushMetrics" }) -> PUT /actions
 
 The RawTree collector turns each metrics JSON object into `sandbox.firecracker.vmm.metrics`.
 
+## Firecracker Vsock
+
+The provider configures a Firecracker vsock device through `firecracker-go-sdk`:
+
+```txt
+Config.VsockDevices -> PUT /vsock/{id}
+```
+
+The host side is a Unix socket path owned by Firecracker. The guest side is a CID and port. The reference uses this channel for provider exec:
+
+```txt
+host exec handler
+  -> dial host vsock socket
+  -> send ExecRequest JSON
+  -> guest control process starts command
+  -> receive started/stdout/stderr/exit frames
+  -> write sandbox.exec.* events to RawTree
+```
+
+This is the important separation: Firecracker gives the provider a host-to-guest transport, and RawTree receives the provider's observations from the host side.
+
 ## Hypervisor Samples
 
 The reference samples the Firecracker process from the host:
@@ -88,7 +114,10 @@ For precise per-sandbox cgroup CPU and memory, run each microVM in its own provi
 ## Security Notes
 
 - Keep RawTree credentials on the host.
+- Do not pass RawTree credentials into the guest control process.
+- Authenticate and authorize exec requests in the provider control plane before dialing vsock.
 - Treat Firecracker logs as operational data that may still contain sensitive paths or configuration.
+- Treat command stdout/stderr as customer data and redact or sample according to product policy.
 - Add provider-specific redaction before writing events to RawTree.
 - Use per-sandbox output files and collector state.
 - Prefer per-sandbox cgroups so CPU and memory samples map cleanly to one sandbox.

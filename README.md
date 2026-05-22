@@ -2,7 +2,9 @@
 
 Reference implementation for adding RawTree observability to a sandbox platform that creates Firecracker microVMs internally.
 
-This repository is intentionally provider-side. It does not create a competing sandbox SDK, it does not ask sandbox users to wrap their sandbox objects, and it does not inject a RawTree guest agent. It uses the official `firecracker-go-sdk` to drive the Firecracker control API, then pushes Firecracker-native logs, Firecracker-native metrics, provider lifecycle events, and host-side hypervisor samples to RawTree.
+This repository is intentionally provider-side. It does not create a competing sandbox SDK and it does not ask sandbox users to wrap their sandbox objects. It uses the official `firecracker-go-sdk` to drive the Firecracker control API, then pushes Firecracker-native logs, Firecracker-native metrics, provider lifecycle events, sandbox exec events, and host-side hypervisor samples to RawTree.
+
+The RawTree API key and RawTree writer stay on the host. For the Vercel-like `create` / `exec` / `stop` lifecycle demo, the provider injects a small guest control process and talks to it over Firecracker vsock. That guest process is not a RawTree agent: it has no RawTree credentials, and it only exists so the provider control plane can run commands in the microVM after boot.
 
 The model is:
 
@@ -10,7 +12,9 @@ The model is:
 your public sandbox API
   -> your internal sandbox control plane
   -> Firecracker microVM creation
+  -> optional provider control agent over vsock
   -> Firecracker-native logs and metrics
+  -> provider exec/lifecycle events
   -> RawTree event stream
 ```
 
@@ -40,23 +44,25 @@ Firecracker orchestrator
   |
   | 2. starts RawTree host collector with provider metadata
   | 3. creates host files for Firecracker logger and metrics
-  | 4. builds firecracker-go-sdk Config
-  | 5. SDK configures logger, metrics, kernel, rootfs, machine, and optional network
-  | 6. SDK starts the microVM
-  | 7. samples Firecracker host PID and cgroup
+  | 4. injects provider control agent into the rootfs copy
+  | 5. builds firecracker-go-sdk Config with a vsock device
+  | 6. SDK configures logger, metrics, kernel, rootfs, machine, vsock, and optional network
+  | 7. SDK starts the microVM
+  | 8. samples Firecracker host PID and cgroup
   v
 Firecracker VMM
   |
-  | 8. writes logs and metrics on the host
+  | 9. writes logs and metrics on the host
+  | 10. exposes provider exec channel over vsock
   v
 RawTree host collector
   |
-  | 9. emits provider lifecycle, hypervisor sample, VMM log, and VMM metric events
+  | 11. emits provider lifecycle, exec, hypervisor sample, VMM log, and VMM metric events
   v
 RawTree API
 ```
 
-The RawTree API key stays on the host side. The guest VM receives no RawTree credentials and no RawTree process is installed inside it.
+The RawTree API key stays on the host side. The guest VM receives no RawTree credentials.
 
 ## What Changes For Sandbox Users
 
@@ -69,17 +75,44 @@ const sandbox = await Sandbox.create();
 await sandbox.runCommand({ cmd: "npm", args: ["test"] });
 ```
 
+This reference CLI exposes the same shape:
+
+```bash
+# Create a basic sandbox.
+go run . create
+
+# Create a sandbox with 1 vCPU and open an interactive shell.
+go run . create --vcpus 1 --connect
+
+# Create a Python sandbox with a custom timeout.
+go run . create --runtime python3.13 --timeout 1h
+
+# Execute a command after the sandbox is already running.
+go run . exec sb_1234567890 ls -la
+
+# Execute with environment variables and a working directory.
+go run . exec --env DEBUG=true --workdir /app sb_1234567890 npm test
+
+# Stop one or more sandboxes.
+go run . stop sb_1234567890 sb_0987654321
+```
+
+In this reference, `--runtime` is provider metadata. In a real platform it would usually select the rootfs, image, snapshot, or language layer before the Firecracker VM is created.
+
 The provider's internal platform code changes:
 
 ```txt
 before Firecracker InstanceStart:
   start RawTree host collector
+  copy/inject the provider control agent into the rootfs or image layer
   configure Firecracker logger and metrics paths through firecracker-go-sdk
+  configure a Firecracker vsock device for provider exec
   configure the normal microVM
 
 while the VM runs:
   keep provider lifecycle correlated by sandbox_id and run_id
   sample host process/cgroup CPU and memory for the Firecracker process
+  send exec requests over vsock and emit exec started/output/completed events
 
 when the provider stops the VM:
   call FlushMetrics
@@ -92,17 +125,20 @@ when the provider stops the VM:
 
 ```txt
 rawtree_firecracker_observability.go
-                                  # CLI wrapper around the provider launch flow
+                                  # CLI wrapper around create/exec/stop and legacy launch flow
+agent_linux.go                    # guest provider-control process for vsock exec
 
 internal/
   orchestrator.go                 # Linux/KVM Firecracker launch via firecracker-go-sdk
+  control_linux.go                # host-side exec/stop control over Firecracker vsock
+  state.go                        # sandbox state files for create/exec/stop
   firecracker_native.go           # Firecracker log/metrics files -> RawTree events
   hypervisor_sampler.go           # host process/cgroup metrics -> RawTree events
   collector.go                    # RawTree writer with provider metadata enrichment
   types.go
 
 scripts/
-  prepare-rich-rootfs.sh          # installs the demo workload into a rootfs copy
+  prepare-rich-rootfs.sh          # optional legacy helper for boot-time workload experiments
   generate-rich-report.mjs        # queries RawTree SQL views and writes an HTML report
 
 sql/
@@ -128,6 +164,13 @@ cfg := firecracker.Config{
   Drives: firecracker.NewDrivesBuilder(paths.RootFSCopyPath).
     WithRootDrive(paths.RootFSCopyPath, firecracker.WithDriveID("rootfs")).
     Build(),
+  VsockDevices: []firecracker.VsockDevice{
+    {
+      ID:   "control",
+      Path: paths.VsockPath,
+      CID:  request.Vsock.GuestCID,
+    },
+  },
   MachineCfg: models.MachineConfiguration{
     MemSizeMib: firecracker.Int64(request.Firecracker.MemMiB),
     VcpuCount:  firecracker.Int64(request.Firecracker.VCPUCount),
@@ -157,6 +200,7 @@ PUT /metrics
 PUT /machine-config
 PUT /boot-source
 PUT /drives/rootfs
+PUT /vsock/control
 PUT /network-interfaces/eth0   # optional
 PUT /actions { "action_type": "InstanceStart" }
 PUT /actions { "action_type": "FlushMetrics" }
@@ -201,19 +245,30 @@ Startup:
 2. Provider allocates `sandbox_id` and `run_id`.
 3. Provider starts the RawTree host collector.
 4. Provider creates host files for Firecracker logs and metrics.
-5. Provider builds `firecracker.Config` with log, metrics, machine, boot, drive, and optional network settings.
-6. Provider creates a `firecracker.Machine`.
-7. The SDK starts Firecracker with the API socket and applies the config.
-8. The SDK starts the microVM with `InstanceStart`.
+5. Provider copies the rootfs and injects the provider control process into that copy.
+6. Provider builds `firecracker.Config` with log, metrics, machine, boot, drive, vsock, and optional network settings.
+7. Provider creates a `firecracker.Machine`.
+8. The SDK starts Firecracker with the API socket and applies the config.
+9. The SDK starts the microVM with `InstanceStart`.
+10. The guest starts the provider control process, which listens on the configured vsock port.
+
+Exec:
+
+1. Provider receives an exec request for a running sandbox.
+2. Provider opens the host side of the Firecracker vsock device.
+3. Provider sends command, environment, working directory, and interactivity options as JSON.
+4. Guest control process starts the command and streams stdout/stderr frames back over vsock.
+5. Host control plane emits `sandbox.exec.*` events to RawTree.
 
 Shutdown:
 
 1. Provider decides the sandbox should stop, or the Firecracker process exits.
 2. Provider calls `FlushMetrics` while Firecracker is still alive.
-3. Provider waits for or terminates Firecracker.
-4. Host collector reads Firecracker logs and metrics from the host files.
-5. Host collector emits the VM stopped event.
-6. Host collector flushes pending RawTree writes and closes.
+3. Provider writes a stop marker and terminates Firecracker.
+4. Supervisor waits for Firecracker to exit.
+5. Host collector reads Firecracker logs and metrics from the host files.
+6. Host collector emits the VM stopped event.
+7. Host collector flushes pending RawTree writes and closes.
 
 ## What We Collect
 
@@ -225,6 +280,15 @@ Provider lifecycle events:
 - stop reason
 - provider metadata
 - sandbox id and run id
+
+Sandbox exec events:
+
+- command requested through the provider exec API
+- environment values passed by the provider
+- working directory, sudo, and interactive flags
+- guest PID when the process starts
+- stdout/stderr chunk size and preview
+- exit code and duration
 
 Firecracker logger events:
 
@@ -251,18 +315,17 @@ In this standalone demo, cgroup values reflect whatever cgroup the Firecracker p
 
 ## What We Do Not Collect
 
-Because this version only uses Firecracker APIs, it does not automatically observe arbitrary activity inside the guest OS:
+Because this version observes Firecracker plus the provider exec control path, it still does not automatically observe arbitrary activity inside the guest OS:
 
-- commands run inside the sandbox
-- subprocess trees
-- file mutations inside the rootfs
-- stdout/stderr from the workload
+- commands not launched through the provider exec API
+- subprocess trees after a command starts
+- file mutations inside the rootfs unless the provider emits them
 - exact HTTP URLs or TLS payloads
 - guest process memory by command
 
-It does sample the host Firecracker process and cgroup. That gives provider-style hypervisor/process telemetry, not per-process memory inside the guest OS.
+It does sample the host Firecracker process and cgroup. That gives provider-style hypervisor/process telemetry, not per-process memory inside the guest OS. The injected guest process exists only to implement provider exec; RawTree ingestion remains host-side.
 
-Those should come from the provider's existing sandbox control plane if it already has exec/files/logs APIs. RawTree can ingest those provider-native events too, but this repo intentionally keeps the Firecracker example limited to Firecracker-native APIs.
+Those should come from the provider's existing sandbox control plane if it already has files, process tree, network, or workload-log APIs. RawTree can ingest those provider-native events too.
 
 ## Requirements
 
@@ -289,7 +352,8 @@ ls -l /dev/kvm
 Guest rootfs:
 
 - whatever your provider normally boots
-- no RawTree process required
+- systemd for this reference injection path, or an equivalent provider-owned init hook
+- no RawTree process or RawTree credentials required
 - no Node.js or `socat` required
 
 For local development on macOS, use `--dry-run`. A real Firecracker boot requires Linux + KVM.
@@ -334,41 +398,62 @@ go run . \
   --metadata environment=poc
 ```
 
-## Real Run
+## Sandbox Lifecycle Run
 
-Run this on a Linux host with KVM:
+Run this on a Linux host with KVM. The CLI also accepts `--api-key`, but passing the key through `RAWTREE_API_KEY` avoids printing it in shell command arguments.
+
+Create a sandbox:
 
 ```bash
-sudo -E go run . \
+export RAWTREE_API_KEY=rt_...
+
+sudo -E go run . create \
   --firecracker /usr/local/bin/firecracker \
   --kernel /var/lib/firecracker/vmlinux \
   --rootfs /var/lib/firecracker/rootfs.ext4 \
+  --runtime node \
+  --timeout 1h \
   --metadata provider=example \
   --metadata environment=poc
 ```
 
-The CLI also accepts `--api-key`, but passing the key through `RAWTREE_API_KEY` avoids printing it in shell command arguments.
+The command prints:
 
-Optional TAP networking:
+```txt
+sandbox_id=sb_...
+run_id=rt_firecracker_sandbox_run_...
+state_file=/tmp/rawtree-firecracker/sandboxes/sb_....json
+```
+
+Run commands in that already-created sandbox:
+
+```bash
+sudo -E go run . exec sb_... ls -la
+sudo -E go run . exec --env DEBUG=true sb_... sh -lc 'echo "$DEBUG"'
+sudo -E go run . exec --workdir /app sb_... npm test
+sudo -E go run . exec --interactive --sudo sb_... sh
+```
+
+Stop the sandbox:
+
+```bash
+sudo -E go run . stop sb_...
+```
+
+Under the hood, `create` starts a supervisor process that owns the Firecracker VM. `exec` and `stop` are separate CLI calls that read the sandbox state file and talk to the running VM/control plane. In production, those are the provider's internal API handlers rather than command-line calls.
+
+The legacy one-shot demo is still available by passing the root flags directly:
 
 ```bash
 sudo -E go run . \
   --firecracker /usr/local/bin/firecracker \
   --kernel /var/lib/firecracker/vmlinux \
-  --rootfs /var/lib/firecracker/rootfs.ext4 \
-  --tap tap0 \
-  --guest-mac AA:FC:00:00:00:01
+  --rootfs /var/lib/firecracker/rootfs.ext4
 ```
-
-The demo has a default `--run-timeout-ms 30000`. When that timeout is reached, it calls `FlushMetrics`, terminates Firecracker, reads the Firecracker log and metrics files, and sends the resulting events to RawTree. In a real provider platform, the stop signal would come from the provider's normal sandbox lifecycle.
 
 ## Rich Example
 
-The rich example prepares a copy of the rootfs with a small boot-time workload.
-That workload writes and reads temporary files and burns CPU for a few short
-bursts. The provider process also moves Firecracker into a dedicated cgroup and
-flushes Firecracker metrics every two seconds, so RawTree receives a useful time
-series instead of only a final metric snapshot.
+The rich example creates a sandbox, then runs multiple commands through the exec API. The workload writes and reads temporary files and burns CPU for a few short bursts. The provider process also moves Firecracker into a dedicated cgroup and flushes Firecracker metrics every two seconds, so RawTree receives a useful time series instead of only a final metric snapshot.
 
 Run it on a Linux host with KVM:
 
@@ -380,6 +465,7 @@ bash examples/rich-firecracker-workload.sh
 What this produces:
 
 - provider lifecycle events
+- sandbox exec command/output/completion events
 - host hypervisor samples every second
 - periodic Firecracker VMM metrics every two seconds
 - Firecracker VMM log lines
@@ -415,6 +501,7 @@ Useful files:
 - `sql/03_firecracker_io_metrics.sql`: rootfs IO and vCPU exit counters
 - `sql/04_firecracker_logs.sql`: Firecracker VMM log lines
 - `sql/05_run_summary.sql`: one-row run summary
+- `sql/06_exec_activity.sql`: command and output events from the vsock exec API
 
 ## Example Events
 
@@ -434,6 +521,25 @@ Provider lifecycle:
     "provider": "example",
     "environment": "poc"
   }
+}
+```
+
+Sandbox exec output:
+
+```json
+{
+  "event_type": "sandbox.exec.output",
+  "event_time": "2026-05-21T12:00:01.000Z",
+  "sampled_at": "2026-05-21T12:00:01.000Z",
+  "provider": "firecracker-sandbox-provider",
+  "sandbox_id": "sb_123",
+  "run_id": "rt_firecracker_sandbox_run_456",
+  "source": "sandbox_vsock_control",
+  "status": "success",
+  "exec_id": "6f0f2c72-0732-4f55-9cf5-90154d5cfba7",
+  "stream": "stdout",
+  "chunk_bytes": 18,
+  "chunk_preview": "hello from sandbox\n"
 }
 ```
 
