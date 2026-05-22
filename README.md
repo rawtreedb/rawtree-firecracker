@@ -417,6 +417,18 @@ sudo -E go run . create \
   --metadata environment=poc
 ```
 
+Optional TAP networking for sandbox commands that need outbound internet:
+
+```bash
+sudo -E go run . create \
+  --firecracker /usr/local/bin/firecracker \
+  --kernel /var/lib/firecracker/vmlinux \
+  --rootfs /var/lib/firecracker/rootfs.ext4 \
+  --runtime node \
+  --tap rtap0 \
+  --guest-mac AA:FC:00:00:00:02
+```
+
 The command prints:
 
 ```txt

@@ -104,6 +104,7 @@ type createArgs struct {
 	cgroupPath                 string
 	connect                    bool
 	firecracker                string
+	guestMAC                   string
 	guestCID                   int
 	hypervisorSampleIntervalMS int
 	kernel                     string
@@ -116,6 +117,7 @@ type createArgs struct {
 	runtime                    string
 	sandboxID                  string
 	table                      string
+	tap                        string
 	timeout                    time.Duration
 	vcpuCount                  int
 	vsockPort                  int
@@ -511,6 +513,7 @@ func parseCreateArgs(argv []string) createArgs {
 	flags.StringVar(&args.cgroupPath, "cgroup-path", "", "Optional cgroup v2 path for the Firecracker process")
 	flags.BoolVar(&args.connect, "connect", false, "Open an interactive shell after the sandbox is ready")
 	flags.StringVar(&args.firecracker, "firecracker", "/usr/local/bin/firecracker", "Firecracker binary path")
+	flags.StringVar(&args.guestMAC, "guest-mac", "", "Guest MAC for optional TAP device")
 	flags.IntVar(&args.guestCID, "guest-cid", defaultVsockGuestCID, "Guest vsock CID")
 	flags.IntVar(&args.hypervisorSampleIntervalMS, "hypervisor-sample-interval-ms", defaultHypervisorSampleIntervalMS, "Host process/cgroup sample interval")
 	flags.StringVar(&args.kernel, "kernel", envDefault("KERNEL", "/var/lib/firecracker/vmlinux"), "Kernel image path")
@@ -523,6 +526,7 @@ func parseCreateArgs(argv []string) createArgs {
 	flags.StringVar(&args.runtime, "runtime", "node", "Runtime metadata, for example node or python3.13")
 	flags.StringVar(&args.sandboxID, "sandbox-id", "sb_"+uuid.NewString(), "Sandbox id")
 	flags.StringVar(&args.table, "table", envDefault("RAWTREE_SANDBOX_TABLE", defaultTable), "RawTree table")
+	flags.StringVar(&args.tap, "tap", "", "Optional TAP device name")
 	flags.StringVar(&timeout, "timeout", defaultSandboxTimeout.String(), "Sandbox lifetime, for example 30m or 1h")
 	flags.IntVar(&args.vcpuCount, "vcpus", 1, "vCPU count")
 	flags.IntVar(&args.vsockPort, "vsock-port", defaultVsockPort, "Guest agent vsock port")
@@ -628,8 +632,10 @@ func sandboxLaunchRequestFromCreateArgs(args createArgs, guestAgentBinary string
 		Firecracker: observability.FirecrackerConfig{
 			Binary:    args.firecracker,
 			BootArgs:  args.bootArgs,
+			GuestMAC:  args.guestMAC,
 			Kernel:    args.kernel,
 			MemMiB:    int64(args.memMiB),
+			Tap:       args.tap,
 			VCPUCount: int64(args.vcpuCount),
 		},
 		GuestAgentBinary:           guestAgentBinary,
